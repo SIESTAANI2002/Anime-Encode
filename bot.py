@@ -124,8 +124,8 @@ def auto_mode(client: Client):
             print("Auto mode error:", e)
             time.sleep(600)
 
-# === Pyrogram Bot Client ===
-app = Client("anime_bot", bot_token=BOT_TOKEN)
+# === Pyrogram Bot Client =
+app = Client("anime_bot", bot_token=os.getenv("BOT_TOKEN"))
 
 pending_videos = {}
 
