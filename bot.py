@@ -8,8 +8,8 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 
 # === CONFIG ===
-BOT_TOKEN = os.getenv("BOT_TOKEN")   # Only bot token required
-CHAT_ID = os.getenv("CHAT_ID")       # Telegram chat/channel ID for auto-upload
+BOT_TOKEN = os.getenv("BOT_TOKEN")        # Your Telegram bot token
+CHAT_ID = os.getenv("CHAT_ID")            # Channel/Group ID for auto-upload
 DOWNLOAD_FOLDER = "downloads"
 ENCODED_FOLDER = "encoded"
 TRACK_FILE = "downloaded.json"
@@ -29,12 +29,13 @@ def save_tracked():
     with open(TRACK_FILE, "w") as f:
         json.dump(list(downloaded_episodes), f)
 
-# === Encoding Function ===
+# === Encode Function ===
 def encode_video(input_path, output_path, progress_callback=None):
     import json
     ext = os.path.splitext(input_path)[1].lower()
     output_path = os.path.splitext(output_path)[0] + ext
 
+    # Detect audio streams
     probe_cmd = [
         "ffprobe", "-v", "error", "-select_streams", "a",
         "-show_entries", "stream=index,codec_name",
@@ -119,13 +120,13 @@ def auto_mode(client: Client):
                     downloaded_episodes.add(url)
                     save_tracked()
                     print(f"✅ Done {title}\n")
-            time.sleep(600)  # check every 10 min
+            time.sleep(600)  # 10 min interval
         except Exception as e:
             print("Auto mode error:", e)
-            time.sleep(600)
+            time.sleep(60)
 
-# === Pyrogram Bot Client =
-app = Client("anime_bot", bot_token=os.getenv("BOT_TOKEN"))
+# === Pyrogram Bot ===
+app = Client("anime_bot", bot_token=BOT_TOKEN)
 
 pending_videos = {}
 
@@ -135,7 +136,7 @@ def handle_video(client, message: Message):
     file_path = os.path.join(DOWNLOAD_FOLDER, file_name)
     message.download(file_path)
     pending_videos[message.message_id] = file_path
-    message.reply(f"✅ Saved {file_name}. Reply with /encode to process.")
+    message.reply(f"✅ Saved {file_name}. Reply to this message with /encode to process.")
 
 @app.on_message(filters.command("encode"))
 def encode_command(client, message: Message):
