@@ -10,8 +10,8 @@ from pyrogram.types import Message
 # === CONFIG ===
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")  # Session string
-CHAT_ID = int(os.getenv("CHAT_ID"))           # Channel/Group ID for auto-upload
+SESSION_STRING = os.getenv("SESSION_STRING")  # use your generated session string
+CHAT_ID = int(os.getenv("CHAT_ID"))           # Telegram chat/channel ID
 DOWNLOAD_FOLDER = "downloads"
 ENCODED_FOLDER = "encoded"
 TRACK_FILE = "downloaded.json"
@@ -100,9 +100,9 @@ def download_file(url, output_path, progress_callback=None):
             if chunk:
                 f.write(chunk)
                 downloaded += len(chunk)
-                if progress_callback and total > 0:
-                    percent = int(downloaded * 100 / total)
-                    progress_callback(f"⬇️ Downloaded: {percent}%")
+                if progress_callback and total:
+                    percent = downloaded * 100 / total
+                    progress_callback(f"⬇️ Downloaded {percent:.2f}%")
     return output_path
 
 def auto_mode(client: Client):
@@ -128,31 +128,32 @@ def auto_mode(client: Client):
                     downloaded_episodes.add(url)
                     save_tracked()
                     print(f"✅ Done {title}\n")
-            time.sleep(600)  # 10 minutes
+            time.sleep(600)  # 10 min
         except Exception as e:
             print("Auto mode error:", e)
             time.sleep(300)
 
 # === Pyrogram Client ===
-app = Client("anime_bot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
+app = Client(name="anime_bot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
 
-pending_videos = {}
+pending_videos = {}  # key: message_id of uploaded video, value: file_path
 
 @app.on_message(filters.video | filters.document)
 def handle_video(client, message: Message):
     file_name = message.document.file_name if message.document else message.video.file_name
     file_path = os.path.join(DOWNLOAD_FOLDER, file_name)
     message.download(file_path)
-    pending_videos[message.id] = file_path
+    pending_videos[message.message_id] = file_path
     message.reply(f"✅ Saved {file_name}. Reply to this message with /encode to start encoding.")
 
 @app.on_message(filters.command("encode"))
 def encode_command(client, message: Message):
     if message.reply_to_message:
-        orig_msg_id = message.reply_to_message.id
+        orig_msg_id = message.reply_to_message.message_id
         if orig_msg_id not in pending_videos:
             message.reply("⚠️ File not found, please upload it again.")
             return
+
         input_path = pending_videos[orig_msg_id]
         output_path = os.path.join(ENCODED_FOLDER, os.path.basename(input_path))
 
