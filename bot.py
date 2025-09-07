@@ -10,8 +10,8 @@ from pyrogram.types import Message
 # === CONFIG ===
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")  # Use session string now
-CHAT_ID = int(os.getenv("CHAT_ID"))           # channel/group id for auto-upload
+SESSION_STRING = os.getenv("SESSION_STRING")  # your generated session string
+CHAT_ID = int(os.getenv("CHAT_ID"))           # channel/group for auto-upload
 DOWNLOAD_FOLDER = "downloads"
 ENCODED_FOLDER = "encoded"
 TRACK_FILE = "downloaded.json"
@@ -122,13 +122,18 @@ def auto_mode(client: Client):
                     downloaded_episodes.add(url)
                     save_tracked()
                     print(f"✅ Done {title}\n")
-            time.sleep(600)  # 10 minutes interval
+            time.sleep(600)  # check every 10 min
         except Exception as e:
             print("Auto mode error:", e)
             time.sleep(300)
 
 # === Pyrogram Client ===
-app = Client(session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
+app = Client(
+    name="anime_bot",
+    session_string=SESSION_STRING,
+    api_id=API_ID,
+    api_hash=API_HASH
+)
 
 pending_videos = {}
 
@@ -150,15 +155,15 @@ def encode_command(client, message: Message):
         input_path = pending_videos[orig_msg_id]
         output_path = os.path.join(ENCODED_FOLDER, os.path.basename(input_path))
 
-        message.reply(f"⚙️ Encoding {os.path.basename(input_path)}...")
+        reply_msg = message.reply(f"⚙️ Encoding {os.path.basename(input_path)}...")
 
         def progress(line):
             try:
-                message.reply(f"📊 {line}")
+                reply_msg.edit_text(f"📊 {line}")
             except: pass
 
         encode_video(input_path, output_path, progress_callback=progress)
-        message.reply(f"✅ Done {os.path.basename(input_path)}")
+        reply_msg.edit_text(f"✅ Done {os.path.basename(input_path)}")
         client.send_document(message.chat.id, output_path)
 
         os.remove(input_path)
