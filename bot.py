@@ -8,12 +8,15 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 
 # === CONFIG ===
-SESSION_STRING = os.getenv("SESSION_STRING")  # your Pyrogram session string
-CHAT_ID = os.getenv("CHAT_ID")                # channel/group id for auto-upload
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+SESSION_STRING = os.getenv("SESSION_STRING")  # Your Pyrogram session string
+CHAT_ID = os.getenv("CHAT_ID")                # Channel/group id for auto-upload
 DOWNLOAD_FOLDER = "downloads"
 ENCODED_FOLDER = "encoded"
 TRACK_FILE = "downloaded.json"
 SUBS_API_URL = "https://subsplease.org/api/?f=latest&tz=UTC"
+AUTO_CHECK_INTERVAL = 600  # 10 minutes
 
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(ENCODED_FOLDER, exist_ok=True)
@@ -120,13 +123,18 @@ def auto_mode(client: Client):
                     downloaded_episodes.add(url)
                     save_tracked()
                     print(f"✅ Done {title}\n")
-            time.sleep(600)  # every 10 minutes
+            time.sleep(AUTO_CHECK_INTERVAL)
         except Exception as e:
             print("Auto mode error:", e)
-            time.sleep(60)
+            time.sleep(300)
 
 # === Pyrogram Client ===
-app = Client("anime_bot", session_string=SESSION_STRING)
+app = Client(
+    ":memory:",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING
+)
 
 pending_videos = {}
 
@@ -135,13 +143,13 @@ def handle_video(client, message: Message):
     file_name = message.document.file_name if message.document else message.video.file_name
     file_path = os.path.join(DOWNLOAD_FOLDER, file_name)
     message.download(file_path)
-    pending_videos[message.message_id] = file_path
+    pending_videos[message.id] = file_path  # changed .message_id -> .id
     message.reply(f"✅ Saved {file_name}. Reply to this message with /encode to process.")
 
 @app.on_message(filters.command("encode"))
 def encode_command(client, message: Message):
     if message.reply_to_message:
-        orig_msg_id = message.reply_to_message.message_id
+        orig_msg_id = message.reply_to_message.id  # changed .message_id -> .id
         if orig_msg_id not in pending_videos:
             message.reply("⚠️ File not found, please upload it again.")
             return
@@ -153,7 +161,8 @@ def encode_command(client, message: Message):
         def progress(line):
             try:
                 message.reply(f"📊 {line}")
-            except: pass
+            except:
+                pass
 
         encode_video(input_path, output_path, progress_callback=progress)
         message.reply(f"✅ Done {os.path.basename(input_path)}")
