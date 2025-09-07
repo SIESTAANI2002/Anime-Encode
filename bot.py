@@ -8,8 +8,8 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 
 # === CONFIG ===
-BOT_TOKEN = os.getenv("BOT_TOKEN")        # Your Telegram bot token
-CHAT_ID = os.getenv("CHAT_ID")            # Channel/Group ID for auto-upload
+SESSION_STRING = os.getenv("SESSION_STRING")  # your Pyrogram session string
+CHAT_ID = os.getenv("CHAT_ID")                # channel/group id for auto-upload
 DOWNLOAD_FOLDER = "downloads"
 ENCODED_FOLDER = "encoded"
 TRACK_FILE = "downloaded.json"
@@ -120,13 +120,13 @@ def auto_mode(client: Client):
                     downloaded_episodes.add(url)
                     save_tracked()
                     print(f"✅ Done {title}\n")
-            time.sleep(600)  # 10 min interval
+            time.sleep(600)  # every 10 minutes
         except Exception as e:
             print("Auto mode error:", e)
             time.sleep(60)
 
-# === Pyrogram Bot ===
-app = Client("anime_bot", bot_token=BOT_TOKEN)
+# === Pyrogram Client ===
+app = Client("anime_bot", session_string=SESSION_STRING)
 
 pending_videos = {}
 
