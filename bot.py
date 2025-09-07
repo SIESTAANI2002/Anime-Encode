@@ -8,15 +8,15 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 
 # === CONFIG ===
-API_ID = int(os.getenv("API_ID"))        # from my.telegram.org
+API_ID = int(os.getenv("API_ID"))        # my.telegram.org
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING") # Pyrogram session string
-CHAT_ID = os.getenv("CHAT_ID")           # channel/group id for auto-upload
+SESSION_STRING = os.getenv("SESSION_STRING")  # Pyrogram string session
+CHAT_ID = int(os.getenv("CHAT_ID"))          # channel/group ID
 DOWNLOAD_FOLDER = "downloads"
 ENCODED_FOLDER = "encoded"
 TRACK_FILE = "downloaded.json"
-PENDING_FILE = "pending_videos.json"
 SUBS_API_URL = "https://subsplease.org/api/?f=latest&tz=UTC"
+AUTO_CHECK_INTERVAL = 600  # 10 minutes
 
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(ENCODED_FOLDER, exist_ok=True)
@@ -28,20 +28,9 @@ if os.path.exists(TRACK_FILE):
 else:
     downloaded_episodes = set()
 
-# Load pending videos
-if os.path.exists(PENDING_FILE):
-    with open(PENDING_FILE, "r") as f:
-        pending_videos = json.load(f)
-else:
-    pending_videos = {}
-
 def save_tracked():
     with open(TRACK_FILE, "w") as f:
         json.dump(list(downloaded_episodes), f)
-
-def save_pending():
-    with open(PENDING_FILE, "w") as f:
-        json.dump(pending_videos, f)
 
 # === Encode Function ===
 def encode_video(input_path, output_path, progress_callback=None):
@@ -125,8 +114,11 @@ def auto_mode(client: Client):
                     output_file = os.path.join(ENCODED_FOLDER, os.path.basename(file_path))
                     encode_video(file_path, output_file)
 
-                    print(f"📤 Uploading {title} to chat")
-                    client.send_document(CHAT_ID, output_file)
+                    try:
+                        client.send_document(CHAT_ID, output_file)
+                        print(f"📤 Uploaded {title}")
+                    except Exception as e:
+                        print(f"⚠️ Failed to upload {title}: {e}")
 
                     os.remove(file_path)
                     os.remove(output_file)
@@ -134,49 +126,52 @@ def auto_mode(client: Client):
                     downloaded_episodes.add(url)
                     save_tracked()
                     print(f"✅ Done {title}\n")
-            time.sleep(600)  # 10 minutes
+            time.sleep(AUTO_CHECK_INTERVAL)
         except Exception as e:
             print("Auto mode error:", e)
-            time.sleep(300)
+            time.sleep(60)
 
 # === Pyrogram Client ===
-app = Client(":memory:", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
+app = Client(name="anime_bot", session_string=SESSION_STRING)
+
+pending_videos = {}
 
 @app.on_message(filters.video | filters.document)
 def handle_video(client, message: Message):
     file_name = message.document.file_name if message.document else message.video.file_name
     file_path = os.path.join(DOWNLOAD_FOLDER, file_name)
     message.download(file_path)
-    pending_videos[str(message.id)] = file_path
-    save_pending()
+    pending_videos[message.message_id] = file_path
     message.reply(f"✅ Saved {file_name}. Reply to this message with /encode to process.")
 
 @app.on_message(filters.command("encode"))
 def encode_command(client, message: Message):
     if message.reply_to_message:
-        orig_msg_id = str(message.reply_to_message.id)
+        orig_msg_id = message.reply_to_message.message_id
         if orig_msg_id not in pending_videos:
             message.reply("⚠️ File not found, please upload it again.")
             return
         input_path = pending_videos[orig_msg_id]
         output_path = os.path.join(ENCODED_FOLDER, os.path.basename(input_path))
 
-        msg = message.reply(f"⚙️ Encoding {os.path.basename(input_path)}...\nProgress: 0%")
+        message.reply(f"⚙️ Encoding {os.path.basename(input_path)}...")
 
         def progress(line):
             try:
-                # Optionally parse frame/time info to estimate percentage
-                msg.edit(f"⚙️ Encoding {os.path.basename(input_path)}...\n{line}")
-            except: pass
+                message.reply(f"📊 {line}")
+            except:
+                pass
 
         encode_video(input_path, output_path, progress_callback=progress)
         message.reply(f"✅ Done {os.path.basename(input_path)}")
-        client.send_document(message.chat.id, output_path)
+        try:
+            client.send_document(message.chat.id, output_path)
+        except Exception as e:
+            message.reply(f"⚠️ Failed to upload: {e}")
 
         os.remove(input_path)
         os.remove(output_path)
         pending_videos.pop(orig_msg_id, None)
-        save_pending()
     else:
         message.reply("Reply to a video/document with /encode to process it.")
 
