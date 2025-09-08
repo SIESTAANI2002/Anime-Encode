@@ -1,94 +1,187 @@
 import os
+import json
 import time
-import asyncio
-import aiohttp
-import aiofiles
-import signal
+import threading
+import subprocess
 import requests
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-# ================= CONFIG =================
-API_ID = int(os.environ.get("API_ID", ""))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-OWNER_ID = int(os.environ.get("OWNER_ID", ""))
-DOWNLOAD_DIR = "./downloads"
-ENCODE_DIR = "./encoded"
+# === CONFIG ===
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+SESSION_STRING = os.getenv("SESSION_STRING")
+CHAT_ID = os.getenv("CHAT_ID")
+DOWNLOAD_FOLDER = "downloads"
+ENCODED_FOLDER = "encoded"
+TRACK_FILE = "downloaded.json"
+SUBS_API_URL = "https://subsplease.org/api/?f=latest&tz=UTC"
 
-# Pyrogram Client
-app = Client("anime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+os.makedirs(ENCODED_FOLDER, exist_ok=True)
 
-# ================= HELPERS =================
-pending_tasks = {}
-cancel_flag = False
+if os.path.exists(TRACK_FILE):
+    with open(TRACK_FILE, "r") as f:
+        downloaded_episodes = set(json.load(f))
+else:
+    downloaded_episodes = set()
 
-async def safe_edit(msg: Message, text: str):
-    """Edit message safely with floodwait handling"""
-    try:
-        await msg.edit_text(text)
-    except Exception as e:
-        if "FloodWait" in str(e):
-            wait_time = int(str(e).split()[-1].replace("s", ""))
-            await asyncio.sleep(wait_time + 1)
-            await safe_edit(msg, text)
+def save_tracked():
+    with open(TRACK_FILE, "w") as f:
+        json.dump(list(downloaded_episodes), f)
+
+# === Encode Function ===
+def encode_video(input_path, output_path, message: Message):
+    import json
+    ext = os.path.splitext(input_path)[1].lower()
+    output_path = os.path.splitext(output_path)[0] + ext
+
+    probe_cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "a",
+        "-show_entries", "stream=index,codec_name",
+        "-of", "json", input_path
+    ]
+    result = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    audio_info = json.loads(result.stdout).get("streams", [])
+
+    command = [
+        "ffmpeg", "-i", input_path,
+        "-vf", "scale=-1:720",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+        "-c:s", "copy"
+    ]
+
+    for stream in audio_info:
+        idx = stream["index"]
+        codec = stream["codec_name"].lower()
+        if codec == "aac":
+            command += [f"-c:a:{idx}", "aac", f"-b:a:{idx}", "128k"]
+        elif codec == "opus":
+            command += [f"-c:a:{idx}", "libopus", f"-b:a:{idx}", "128k"]
+        elif codec == "mp3":
+            command += [f"-c:a:{idx}", "libmp3lame", f"-b:a:{idx}", "128k"]
+        elif codec == "flac":
+            command += [f"-c:a:{idx}", "flac"]
         else:
-            print(f"safe_edit error: {e}")
+            command += [f"-c:a:{idx}", "aac", f"-b:a:{idx}", "128k"]
 
-def format_progress(task: str, filename: str, percent: float, elapsed: int, eta: int):
-    return (
-        f"Name » {filename}\n"
-        f"⌑ Task   » {task}\n"
-        f"⌑ {percent:.2f}%\n"
-        f"⌑ Finished : {elapsed}s | ETA: {eta}s"
-    )
+    command += ["-y", output_path]
 
-async def run_progress(task: str, filename: str, total: int, progress_msg: Message):
-    """Dummy progress loop for demo (replace with real download/encode/upload loops)"""
-    start = time.time()
-    last_update = 0
-    for i in range(0, total + 1, 5):
-        if cancel_flag:
-            await safe_edit(progress_msg, f"❌ {task} cancelled for {filename}")
-            return
-        now = time.time()
-        elapsed = int(now - start)
-        eta = max(0, int((total - i) / 5))
-        if now - last_update >= 20 or i == total:  # update every 20s or at end
-            percent = (i / total) * 100
-            msg_text = format_progress(task, filename, percent, elapsed, eta)
-            await safe_edit(progress_msg, msg_text)
-            last_update = now
-        await asyncio.sleep(1)  # simulate work
-    await safe_edit(progress_msg, f"✅ {task} complete for {filename}")
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
-# ================= BOT COMMANDS =================
-@app.on_message(filters.command("start") & filters.user(OWNER_ID))
-async def start_cmd(client, message: Message):
-    await message.reply_text("✅ Bot is running and ready!")
+    last_update = time.time()
+    progress_msg = message.reply_text(f"⚙️ Encoding {os.path.basename(input_path)}...")
 
-@app.on_message(filters.command("download") & filters.user(OWNER_ID))
-async def download_cmd(client, message: Message):
-    filename = "sample_anime.mkv"
-    progress_msg = await message.reply_text(f"📥 Starting download: {filename}")
-    pending_tasks[progress_msg.id] = filename
-    await run_progress("Downloading", filename, 100, progress_msg)
-    await run_progress("Encoding", filename, 100, progress_msg)
-    await run_progress("Uploading", filename, 100, progress_msg)
+    for line in process.stdout:
+        if ("frame=" in line or "time=" in line) and time.time() - last_update > 20:
+            last_update = time.time()
+            try:
+                progress_msg.edit_text(f"📊 {line.strip()}")
+            except:
+                pass
 
-@app.on_message(filters.command("cancel") & filters.user(OWNER_ID))
-async def cancel_cmd(client, message: Message):
-    global cancel_flag
-    cancel_flag = True
-    await message.reply_text("⚠️ All running tasks cancelled.")
+    process.wait()
+    return output_path
 
-# ================= MAIN =================
-def handle_sigterm(*_):
-    loop = asyncio.get_event_loop()
-    loop.create_task(app.stop())
+# === SubsPlease Auto Download ===
+def get_recent_releases():
+    releases = []
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        res = requests.get(SUBS_API_URL, headers=headers, timeout=15)
+        try:
+            data = res.json()
+        except ValueError:
+            print("⚠️ SubsPlease returned non-JSON, skipping this check.")
+            return []
 
-signal.signal(signal.SIGTERM, handle_sigterm)
+        for ep in data.get("data", []):
+            title = ep["release_title"]
+            link = ep["link"]
+            releases.append((title, link))
+    except Exception as e:
+        print("SubsPlease API error:", e)
+    return releases
+
+def download_file(url, output_path, message: Message):
+    r = requests.get(url, stream=True)
+    total_length = r.headers.get('content-length')
+    if total_length is None:
+        with open(output_path, "wb") as f:
+            f.write(r.content)
+        return output_path
+
+    dl = 0
+    total_length = int(total_length)
+    start_time = time.time()
+    progress_msg = message.reply_text(f"⬇️ Downloading {os.path.basename(output_path)}...")
+    last_update = time.time()
+
+    with open(output_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+                dl += len(chunk)
+                if time.time() - last_update > 20:
+                    last_update = time.time()
+                    percent = dl / total_length * 100
+                    elapsed = time.time() - start_time
+                    speed = dl / elapsed
+                    try:
+                        progress_msg.edit_text(
+                            f"⬇️ Downloading {os.path.basename(output_path)}\n"
+                            f"{percent:.2f}% ({dl//1024//1024}MB / {total_length//1024//1024}MB)\n"
+                            f"Speed: {speed/1024/1024:.2f} MB/s"
+                        )
+                    except:
+                        pass
+    return output_path
+
+def auto_mode(client: Client):
+    while True:
+        try:
+            recent = get_recent_releases()
+            for title, url in recent:
+                if url not in downloaded_episodes:
+                    file_path = os.path.join(DOWNLOAD_FOLDER, title + os.path.splitext(url)[1])
+                    dummy_msg = client.send_message(CHAT_ID, f"📥 Auto-downloading {title}")
+                    download_file(url, file_path, dummy_msg)
+
+                    output_file = os.path.join(ENCODED_FOLDER, os.path.basename(file_path))
+                    encode_video(file_path, output_file, dummy_msg)
+
+                    client.send_document(CHAT_ID, output_file)
+
+                    os.remove(file_path)
+                    os.remove(output_file)
+                    downloaded_episodes.add(url)
+                    save_tracked()
+            time.sleep(600)
+        except Exception as e:
+            print("Auto mode error:", e)
+            time.sleep(60)
+
+# === Pyrogram Client ===
+app = Client(name="anime_userbot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
+
+@app.on_message(filters.video | filters.document)
+def handle_video(client, message: Message):
+    file_name = message.document.file_name if message.document else message.video.file_name
+    file_path = os.path.join(DOWNLOAD_FOLDER, file_name)
+
+    # download and encode directly (no /encode step)
+    download_file(message.download(file_path), file_path, message)
+    output_path = os.path.join(ENCODED_FOLDER, file_name)
+    encode_video(file_path, output_path, message)
+
+    message.reply_document(output_path)
+
+    os.remove(file_path)
+    os.remove(output_path)
 
 if __name__ == "__main__":
+    threading.Thread(target=auto_mode, args=(app,), daemon=True).start()
     print("Bot is running...")
     app.run()
