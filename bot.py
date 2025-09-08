@@ -1,10 +1,11 @@
 import os
 import json
 import time
-import asyncio
 import threading
 import subprocess
+import requests
 import psutil
+import asyncio
 from datetime import datetime
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -12,8 +13,9 @@ from pyrogram.types import Message
 # === CONFIG ===
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")  # Your Pyrogram session string
-CHAT_ID = int(os.getenv("CHAT_ID"))           # Only your user ID
+SESSION_STRING = os.getenv("SESSION_STRING")
+CHAT_ID = int(os.getenv("CHAT_ID"))
+
 DOWNLOAD_FOLDER = "downloads"
 ENCODED_FOLDER = "encoded"
 TRACK_FILE = "downloaded.json"
@@ -35,35 +37,34 @@ def save_tracked():
 
 # === TASK QUEUE ===
 task_queue = []
-active_task = None
-cancel_flag = False
-skip_flag = False
-start_time = time.time()
+current_task = None
+task_lock = threading.Lock()
+cancel_task = False
+skip_task = False
 
-def human_readable_size(size, decimal_places=2):
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
+def human_size(size):
+    for unit in ["B","KB","MB","GB","TB"]:
         if size < 1024:
-            return f"{size:.{decimal_places}f}{unit}"
+            return f"{size:.2f}{unit}"
         size /= 1024
-    return f"{size:.{decimal_places}f}PB"
+    return f"{size:.2f}PB"
 
-def uptime():
-    seconds = int(time.time() - start_time)
-    m, s = divmod(seconds, 60)
-    h, m = divmod(m, 60)
-    d, h = divmod(h, 24)
-    return f"{d}d {h}h {m}m {s}s"
+def get_disk_usage():
+    disk = psutil.disk_usage("/")
+    return f"FREE: {human_size(disk.free)} | Used: {human_size(disk.used)}"
 
-# === FANCY PROGRESS BAR ===
-def create_progress_bar(progress, length=10):
-    filled = int(length * progress)
-    empty = length - filled
-    bar = "█" * filled + "▒" * empty
-    return bar
+def get_uptime():
+    return str(datetime.now() - datetime.fromtimestamp(psutil.boot_time())).split('.')[0]
 
-# === FFmpeg Encode Function ===
-def encode_video(input_path, output_path, progress_callback=None):
-    import json
+def fancy_progress_bar(done, total, length=20):
+    ratio = done/total if total else 0
+    filled = int(ratio*length)
+    bar = "█"*filled + "▒"*(length-filled)
+    percent = ratio*100
+    return f"{bar} » {percent:.2f}%"
+
+# === ENCODING ===
+def encode_video(input_path, output_path, update_func):
     ext = os.path.splitext(input_path)[1].lower()
     output_path = os.path.splitext(output_path)[0] + ext
 
@@ -102,14 +103,19 @@ def encode_video(input_path, output_path, progress_callback=None):
     command += ["-y", output_path]
 
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    for line in process.stdout:
-        if progress_callback and ("frame=" in line or "time=" in line):
-            progress_callback(line.strip())
+    total = os.path.getsize(input_path)
+    while True:
+        if cancel_task or skip_task:
+            process.kill()
+            return None
+        line = process.stdout.readline()
+        if not line:
+            break
+        update_func(line.strip())
     process.wait()
     return output_path
 
-# === SUBSPLASE DOWNLOAD ===
-import requests
+# === SUBSPLAE DOWNLOAD ===
 def get_recent_releases():
     releases = []
     try:
@@ -122,108 +128,107 @@ def get_recent_releases():
         print("SubsPlease API error:", e)
     return releases
 
-def download_file(url, output_path, progress_callback=None):
+def download_file(url, output_path, update_func):
     r = requests.get(url, stream=True)
-    total = int(r.headers.get('content-length', 0))
-    downloaded = 0
-    start = time.time()
+    total = int(r.headers.get("content-length", 0))
+    done = 0
+    start_time = time.time()
     with open(output_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=8192):
+            if cancel_task or skip_task:
+                return None
             if chunk:
                 f.write(chunk)
-                downloaded += len(chunk)
-                if progress_callback and total > 0:
-                    elapsed = time.time() - start
-                    speed = downloaded / elapsed
-                    progress_callback(downloaded, total, speed)
+                done += len(chunk)
+                elapsed = time.time() - start_time
+                speed = human_size(done/elapsed) + "/s" if elapsed > 0 else "0B/s"
+                eta = (total - done)/ (done/elapsed) if done>0 else 0
+                bar = fancy_progress_bar(done, total)
+                update_func(f"⌑ Downloading » {speed}\n⌑ {bar}\n⌑ Done » {human_size(done)} of {human_size(total)}\n⌑ ETA » {int(eta)}s")
+
     return output_path
 
-# === PYROGRAM CLIENT ===
-app = Client(name="anime_bot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
-
-# === TASK PROCESSOR ===
-async def process_tasks():
-    global active_task, cancel_flag, skip_flag
-    while True:
-        if not active_task and task_queue:
-            active_task = task_queue.pop(0)
-            try:
-                message, input_path = active_task
-                cancel_flag = False
-                skip_flag = False
-
-                # Download step
-                await message.edit("⌑ Downloading...")
-                def dl_progress(dl, total, speed):
-                    percent = dl / total
-                    bar = create_progress_bar(percent, 10)
-                    text = f"Name » [{os.path.basename(input_path)}]\n⌑ Downloading » {human_readable_size(speed)}/s\n⌑ {bar} » {percent*100:.2f}%"
-                    asyncio.create_task(message.edit(text))
-                download_file(input_path, input_path, dl_progress)
-
-                # Encode step
-                await message.edit("⌑ Encoding...")
-                def enc_progress(line):
-                    asyncio.create_task(message.edit(f"⌑ Encoding » {line}"))
-                output_file = os.path.join(ENCODED_FOLDER, os.path.basename(input_path))
-                encode_video(input_path, output_file, enc_progress)
-
-                # Upload step
-                await message.edit("⌑ Uploading...")
-                await app.send_document(CHAT_ID, output_file)
-
-                # Cleanup
-                os.remove(input_path)
-                os.remove(output_file)
-                await message.edit("✅ Task Completed")
-
-            except Exception as e:
-                await message.edit(f"❌ Error: {e}")
-
-            active_task = None
-        await asyncio.sleep(5)
-
-# === MESSAGE HANDLERS ===
-@app.on_message(filters.private & filters.user(CHAT_ID) & (filters.video | filters.document))
-async def handle_upload(client, message: Message):
-    file_path = os.path.join(DOWNLOAD_FOLDER, message.document.file_name if message.document else message.video.file_name)
-    await message.download(file_path)
-    task_queue.append((message, file_path))
-    await message.reply(f"✅ Task added to queue. Position: {len(task_queue)}")
-
-@app.on_message(filters.command("cancel") & filters.private & filters.user(CHAT_ID))
-async def cancel_task(client, message: Message):
-    global cancel_flag, active_task
-    if active_task:
-        cancel_flag = True
-        await message.reply("⚠️ Active task canceled.")
-    else:
-        await message.reply("⚠️ No active task.")
-
-@app.on_message(filters.command("skip") & filters.private & filters.user(CHAT_ID))
-async def skip_task(client, message: Message):
-    global skip_flag, active_task
-    if active_task:
-        skip_flag = True
-        await message.reply("⚠️ Skipping current task...")
-    else:
-        await message.reply("⚠️ No active task.")
-
-@app.on_message(filters.command("queue") & filters.private & filters.user(CHAT_ID))
-async def show_queue(client, message: Message):
-    text = "⌑ Current Queue:\n"
-    for i, (msg, path) in enumerate(task_queue[:5]):
-        text += f"{i+1}. {os.path.basename(path)}\n"
-    if not task_queue:
-        text += "Queue is empty."
-    await message.reply(text)
-
-# === AUTO MODE (SubsPlease) ===
-async def auto_mode():
+def auto_mode(client: Client):
+    global current_task
     while True:
         try:
             recent = get_recent_releases()
             for title, url in recent:
                 if url not in downloaded_episodes:
                     file_path = os.path.join(DOWNLOAD_FOLDER, title + ".mkv")
-                    task_queue.append((None, file_path))  # Auto
+                    output_file = os.path.join(ENCODED_FOLDER, os.path.basename(file_path))
+                    current_task = f"Auto {title}"
+                    # Download
+                    download_file(url, file_path, lambda msg: print(msg))
+                    # Encode
+                    encode_video(file_path, output_file, lambda msg: print(msg))
+                    # Upload
+                    client.send_document(CHAT_ID, output_file)
+                    os.remove(file_path)
+                    os.remove(output_file)
+                    downloaded_episodes.add(url)
+                    save_tracked()
+                    current_task = None
+            time.sleep(600)  # 10 min
+        except Exception as e:
+            print("Auto mode error:", e)
+            time.sleep(60)
+
+# === PYROGRAM CLIENT ===
+app = Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
+pending_videos = {}
+
+@app.on_message(filters.video | filters.document)
+def handle_video(client, message: Message):
+    file_name = message.document.file_name if message.document else message.video.file_name
+    file_path = os.path.join(DOWNLOAD_FOLDER, file_name)
+    message.download(file_path)
+    pending_videos[message.id] = file_path
+    message.reply(f"✅ Saved {file_name}. Reply to this message with /encode to start encoding.")
+
+@app.on_message(filters.command("encode"))
+def encode_command(client, message: Message):
+    global current_task, cancel_task, skip_task
+    if not message.reply_to_message:
+        message.reply("Reply to a video/document with /encode to process it.")
+        return
+    orig_id = message.reply_to_message.id
+    if orig_id not in pending_videos:
+        message.reply("⚠️ File not found. Make sure the video is fully uploaded/downloaded.")
+        return
+
+    input_path = pending_videos[orig_id]
+    output_path = os.path.join(ENCODED_FOLDER, os.path.basename(input_path))
+    cancel_task = False
+    skip_task = False
+    current_task = os.path.basename(input_path)
+
+    progress_msg = message.reply(f"⌑ Task started for {current_task}")
+
+    def update_progress(line):
+        try:
+            progress_msg.edit(f"Name » [{current_task}]\n{line}\nDisk » {get_disk_usage()}\nUptime » {get_uptime()}")
+        except:
+            pass
+
+    encode_video(input_path, output_path, update_progress)
+    message.reply(f"✅ Done {current_task}")
+    client.send_document(message.chat.id, output_path)
+    os.remove(input_path)
+    os.remove(output_path)
+    pending_videos.pop(orig_id, None)
+    current_task = None
+
+@app.on_message(filters.command("cancel"))
+def cancel(client, message: Message):
+    global cancel_task
+    cancel_task = True
+    message.reply("⚠️ Current task canceled.")
+
+@app.on_message(filters.command("skip"))
+def skip(client, message: Message):
+    global skip_task
+    skip_task = True
+    message.reply("⚠️ Current task skipped.")
+
+# === RUN BOT
