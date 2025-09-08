@@ -3,19 +3,20 @@ import json
 import time
 import threading
 import subprocess
-import requests
+from datetime import datetime
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
 # === CONFIG ===
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")
-CHAT_ID = int(os.getenv("CHAT_ID"))  # channel/group id
+SESSION_STRING = os.getenv("SESSION_STRING")  # Pyrogram session string
+CHAT_ID = int(os.getenv("CHAT_ID"))           # Telegram chat/channel id
 DOWNLOAD_FOLDER = "downloads"
 ENCODED_FOLDER = "encoded"
 TRACK_FILE = "downloaded.json"
 SUBS_API_URL = "https://subsplease.org/api/?f=latest&tz=UTC"
+TASK_INTERVAL = 600  # 10 minutes
 
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(ENCODED_FOLDER, exist_ok=True)
@@ -27,30 +28,27 @@ if os.path.exists(TRACK_FILE):
 else:
     downloaded_episodes = set()
 
+
 def save_tracked():
     with open(TRACK_FILE, "w") as f:
         json.dump(list(downloaded_episodes), f)
 
-# === Progress Bar Helper ===
-def progress_bar(current, total, length=20):
-    filled = int(length * current // total)
-    empty = length - filled
-    percent = current / total * 100
-    return f"[{'█'*filled}{'▒'*empty}] {percent:.2f}%"
+
+# === Progress Bar ===
+def progress_bar(current, total, size=20):
+    if total == 0:
+        return "0%"
+    percent = current / total
+    done = int(size * percent)
+    left = size - done
+    bar = "█" * done + "▒" * left
+    return f"{percent*100:.2f}% | {bar}"
+
 
 # === Encode Function ===
-def encode_video(input_path, output_path, progress_callback=None):
-    import json
+def encode_video(input_path, output_path, progress_msg=None):
     ext = os.path.splitext(input_path)[1].lower()
     output_path = os.path.splitext(output_path)[0] + ext
-
-    probe_cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=index,codec_name",
-        "-of", "json", input_path
-    ]
-    result = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    audio_info = json.loads(result.stdout).get("streams", [])
 
     command = [
         "ffmpeg", "-i", input_path,
@@ -58,105 +56,112 @@ def encode_video(input_path, output_path, progress_callback=None):
         "-c:v", "libx264",
         "-preset", "fast",
         "-crf", "23",
-        "-c:s", "copy"
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-y", output_path
     ]
 
-    for stream in audio_info:
-        idx = stream["index"]
-        codec = stream["codec_name"].lower()
-        if codec == "aac":
-            command += [f"-c:a:{idx}", "aac", f"-b:a:{idx}", "128k"]
-        elif codec == "opus":
-            command += [f"-c:a:{idx}", "libopus", f"-b:a:{idx}", "128k"]
-        elif codec == "mp3":
-            command += [f"-c:a:{idx}", "libmp3lame", f"-b:a:{idx}", "128k"]
-        elif codec == "flac":
-            command += [f"-c:a:{idx}", "flac"]
-        else:
-            command += [f"-c:a:{idx}", "aac", f"-b:a:{idx}", "128k"]
-
-    command += ["-y", output_path]
-
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
     for line in process.stdout:
-        if progress_callback and ("frame=" in line or "time=" in line):
-            progress_callback(line.strip())
+        if "frame=" in line or "time=" in line:
+            if progress_msg:
+                progress_msg.edit_text(f"⌑ Task   » Encoding\n⌑ {os.path.basename(input_path)}\n⌑ {line.strip()}")
+
     process.wait()
     return output_path
+
 
 # === SubsPlease Auto Download ===
 def get_recent_releases():
     releases = []
     try:
-        res = requests.get(SUBS_API_URL, timeout=15)
-        data = res.json()
-        for ep in data.get("data", []):
+        import requests
+        res = requests.get(SUBS_API_URL, timeout=15).json()
+        for ep in res.get("data", []):
             title = ep["release_title"]
             link = ep["link"]
             releases.append((title, link))
     except Exception as e:
-        print("SubsPlease returned non-JSON, retrying in 60s")
+        print("SubsPlease returned non-JSON content, retrying in 60s")
     return releases
 
-def download_file(url, output_path, progress_callback=None):
-    r = requests.get(url, stream=True)
-    total = int(r.headers.get('content-length', 0))
-    downloaded = 0
-    last_update = time.time()
-    with open(output_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1024*1024):  # 1MB chunks
-            if chunk:
-                f.write(chunk)
-                downloaded += len(chunk)
-                now = time.time()
-                if progress_callback and (now - last_update > 5):  # update every 5s
-                    last_update = now
-                    progress_callback(downloaded, total)
-    return output_path
+
+def auto_mode(client: Client):
+    while True:
+        try:
+            recent = get_recent_releases()
+            for title, url in recent:
+                if url not in downloaded_episodes:
+                    file_path = os.path.join(DOWNLOAD_FOLDER, title + os.path.splitext(url)[1])
+                    # Download file
+                    print(f"⬇️ Downloading {title} ...")
+                    # For SubsPlease you can add download_file(url, file_path)
+                    # Skipping for now as per user's manual upload
+                    downloaded_episodes.add(url)
+                    save_tracked()
+            time.sleep(TASK_INTERVAL)
+        except Exception as e:
+            print("Auto mode error:", e)
+            time.sleep(60)
+
 
 # === Pyrogram Client ===
-app = Client(name="anime_bot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
-pending_videos = {}
+app = Client(
+    name="anime_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING
+)
+
+pending_videos = []
+is_task_running = False
+
+
+def run_next_task(client):
+    global is_task_running
+    if is_task_running or not pending_videos:
+        return
+
+    is_task_running = True
+    task = pending_videos.pop(0)
+    input_path, progress_msg = task
+    output_path = os.path.join(ENCODED_FOLDER, os.path.basename(input_path))
+
+    progress_msg.edit_text(f"⌑ Task   » Encoding\n⌑ {os.path.basename(input_path)}\n⌑ 0%")
+    encode_video(input_path, output_path, progress_msg)
+    progress_msg.edit_text(f"⌑ Task   » Uploading\n⌑ {os.path.basename(input_path)}\n⌑ 0%")
+
+    client.send_document(CHAT_ID, output_path)
+    progress_msg.edit_text(f"✅ Finished {os.path.basename(input_path)}")
+    os.remove(input_path)
+    os.remove(output_path)
+    is_task_running = False
+
+    # Run next in queue
+    run_next_task(client)
+
 
 @app.on_message(filters.video | filters.document)
 def handle_video(client, message: Message):
     file_name = message.document.file_name if message.document else message.video.file_name
     file_path = os.path.join(DOWNLOAD_FOLDER, file_name)
+
     progress_msg = message.reply(f"⌑ Task   » Downloading\n⌑ {file_name}\n⌑ 0%")
-    
-    def download_progress(downloaded, total):
-        progress = progress_bar(downloaded, total)
+
+    def tg_progress(current, total):
+        progress = progress_bar(current, total)
         progress_msg.edit_text(f"⌑ Task   » Downloading\n⌑ {file_name}\n⌑ {progress}")
-    
-    download_file(message.download(file_path), file_path, progress_callback=download_progress)
-    
-    # Auto start encoding
-    pending_videos[message.id] = (file_path, progress_msg)
-    encode_command(client, message)
 
-@app.on_message(filters.command("encode"))
-def encode_command(client, message: Message):
-    if message.reply_to_message:
-        orig_msg_id = message.reply_to_message.id
-        if orig_msg_id not in pending_videos:
-            message.reply("⚠️ File not found. Make sure the video is fully uploaded/downloaded.")
-            return
-        input_path, progress_msg = pending_videos.pop(orig_msg_id)
-        output_path = os.path.join(ENCODED_FOLDER, os.path.basename(input_path))
+    message.download(file_path, progress=tg_progress)
+    pending_videos.append((file_path, progress_msg))
 
-        def encoding_progress(line):
-            progress_msg.edit_text(f"⌑ Task   » Encoding\n⌑ {os.path.basename(input_path)}\n⌑ {line}")
+    # Start encoding automatically
+    run_next_task(client)
 
-        encode_video(input_path, output_path, progress_callback=encoding_progress)
-        progress_msg.edit_text(f"✅ Finished Encoding: {os.path.basename(input_path)}")
-        client.send_document(message.chat.id, output_path)
-
-        os.remove(input_path)
-        os.remove(output_path)
-    else:
-        message.reply("Reply to a video/document with /encode to process it.")
 
 # === Run Bot ===
 if __name__ == "__main__":
+    threading.Thread(target=auto_mode, args=(app,), daemon=True).start()
     print("Bot is running...")
     app.run()
