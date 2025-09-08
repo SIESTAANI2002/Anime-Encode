@@ -200,4 +200,4 @@ if __name__ == "__main__":
     app.start()
     threading.Thread(target=auto_mode, daemon=True).start()
     print("✅ Bot is running...")
-    app.idle()
+    app.run()
