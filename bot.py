@@ -1,17 +1,15 @@
 import os
 import asyncio
-import aiofiles
 import aiohttp
-import math
+import aiofiles
 import shutil
 import time
-import logging
-import psutil
+import math
+from datetime import timedelta
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from datetime import timedelta
 from dotenv import load_dotenv
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import subprocess
 
 load_dotenv()
@@ -19,122 +17,203 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
-CHAT_ID = int(os.getenv("CHAT_ID"))
 
-logging.basicConfig(level=logging.INFO)
+app = Client("my_userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
-app = Client(
-    name="anime_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING
-)
+# Global states
+job_queue = []
+active_job = None
+cancel_flag = False
+skip_flag = False
 
-# -------- Progress Bar --------
-def progress_bar(current, total, length=20):
-    filled = int(length * current // total)
-    bar = "█" * filled + "▒" * (length - filled)
-    percent = (current / total) * 100
-    return f"{bar} {percent:.2f}%"
 
-def format_time(seconds: float):
-    return str(timedelta(seconds=int(seconds)))
+def human_readable_size(size):
+    # Convert bytes to human-readable
+    power = 2**10
+    n = 0
+    units = ["B", "KB", "MB", "GB", "TB"]
+    while size >= power and n < len(units)-1:
+        size /= power
+        n += 1
+    return f"{size:.2f}{units[n]}"
 
-# -------- Video Encoding --------
-async def encode_video(file_path, output_path, update_cb=None):
-    total_time = None
-    start = time.time()
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-i", file_path, "-c:v", "libx265", "-crf", "28", output_path,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
 
-    async for line in process.stderr:
-        line = line.decode("utf-8", errors="ignore").strip()
-        if "Duration" in line:
-            t_str = line.split("Duration:")[1].split(",")[0].strip()
-            h, m, s = t_str.split(":")
-            total_time = int(float(h)) * 3600 + int(m) * 60 + float(s)
-        if "time=" in line and total_time:
-            t_str = line.split("time=")[1].split(" ")[0]
-            try:
-                if ":" in t_str:  # format hh:mm:ss.xx
-                    h, m, s = t_str.split(":")
-                    cur_time = int(float(h)) * 3600 + int(m) * 60 + float(s)
-                else:  # format seconds.xx
-                    cur_time = float(t_str)
-            except Exception:
-                continue
-
-            percent = (cur_time / total_time) * 100
-            if update_cb:
-                await update_cb(cur_time, total_time, start)
-
-    await process.wait()
-    return process.returncode == 0
-
-# -------- Progress Update --------
-async def progress_message(msg: Message, task: str, current, total, start, filename):
-    elapsed = time.time() - start
+async def progress_bar(current, total, start_time, task, filename):
+    percent = current * 100 / total
+    elapsed = time.time() - start_time
     speed = current / elapsed if elapsed > 0 else 0
     eta = (total - current) / speed if speed > 0 else 0
-    bar = progress_bar(current, total)
 
-    text = (
-        f"📂 **Name:** {os.path.basename(filename)}\n"
-        f"⌑ **Task:** {task}\n"
-        f"⌑ {bar}\n"
-        f"⌑ **Done:** {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB\n"
-        f"⌑ **Speed:** {speed/1024/1024:.2f}MB/s\n"
-        f"⌑ **ETA:** {format_time(eta)}\n"
-        f"⌑ **Elapsed:** {format_time(elapsed)}"
+    bar_length = 14
+    filled = math.floor(percent / (100 / bar_length))
+    bar = "█" * filled + "▒" * (bar_length - filled)
+
+    return (
+        f"**Name »** `{filename}`\n"
+        f"**⌑ Task   »** {task}\n"
+        f"**⌑ {bar} » {percent:.2f}%**\n"
+        f"**⌑ Done   :** {human_readable_size(current)} of {human_readable_size(total)}\n"
+        f"**⌑ Speed  :** {human_readable_size(speed)}/s\n"
+        f"**⌑ ETA    :** {str(timedelta(seconds=int(eta)))}\n"
+        f"**⌑ Past   :** {str(timedelta(seconds=int(elapsed)))}"
     )
 
-    try:
-        await msg.edit_text(text)
-    except Exception:
-        pass
 
-# -------- Encode Command --------
+async def download_file(url, path, msg: Message, filename):
+    global cancel_flag, skip_flag
+    cancel_flag = False
+    skip_flag = False
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            start = time.time()
+
+            async with aiofiles.open(path, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1024 * 512):  # 512KB
+                    if cancel_flag:
+                        await msg.edit_text("⚠️ Download cancelled.")
+                        return False
+                    if skip_flag:
+                        await msg.edit_text("⏭️ Download skipped.")
+                        return False
+
+                    await f.write(chunk)
+                    downloaded += len(chunk)
+
+                    if downloaded % (1024 * 1024) < 512 * 1024:  # update every ~1MB
+                        text = await progress_bar(downloaded, total, start, "Downloading", filename)
+                        try:
+                            await msg.edit_text(text)
+                        except:
+                            pass
+
+    await msg.edit_text(f"✅ Saved {filename}")
+    return True
+
+
+async def encode_video(input_file, output_file, msg, filename):
+    global cancel_flag, skip_flag
+    cancel_flag = False
+    skip_flag = False
+
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-i", input_file, "-c:v", "libx264", "-preset", "fast",
+        "-c:a", "aac", "-b:a", "128k", output_file,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+
+    start = time.time()
+    while True:
+        if cancel_flag:
+            process.kill()
+            await msg.edit_text("⚠️ Encoding cancelled.")
+            return False
+        if skip_flag:
+            process.kill()
+            await msg.edit_text("⏭️ Encoding skipped.")
+            return False
+
+        line = await process.stderr.readline()
+        if not line:
+            break
+        line = line.decode("utf-8", errors="ignore")
+        if "time=" in line:
+            try:
+                t_str = line.split("time=")[1].split(" ")[0]
+                h, m, s = t_str.split(":")
+                elapsed_enc = int(float(h)) * 3600 + int(m) * 60 + float(s)
+                percent = min(100, (elapsed_enc / 600) * 100)  # fake 10min est
+                bar_length = 14
+                filled = math.floor(percent / (100 / bar_length))
+                bar = "█" * filled + "▒" * (bar_length - filled)
+                text = (
+                    f"**Name »** `{filename}`\n"
+                    f"**⌑ Task   »** Encoding\n"
+                    f"**⌑ {bar} » {percent:.2f}%**\n"
+                    f"**⌑ Elapsed :** {str(timedelta(seconds=int(time.time()-start)))}"
+                )
+                try:
+                    await msg.edit_text(text)
+                except:
+                    pass
+            except:
+                pass
+
+    await process.wait()
+    await msg.edit_text(f"✅ Encoding complete: {output_file}")
+    return True
+
+
+async def upload_file(path, msg, filename):
+    global cancel_flag, skip_flag
+    cancel_flag = False
+    skip_flag = False
+
+    file_size = os.path.getsize(path)
+    start = time.time()
+
+    async def progress(current, total):
+        text = await progress_bar(current, total, start, "Uploading", filename)
+        try:
+            await msg.edit_text(text)
+        except:
+            pass
+
+    try:
+        await app.send_document(msg.chat.id, path, progress=progress)
+        await msg.edit_text(f"✅ Upload complete: {filename}")
+    except Exception as e:
+        await msg.edit_text(f"⚠️ Upload failed: {e}")
+
+
 @app.on_message(filters.command("encode") & filters.reply)
 async def manual_encode(_, message: Message):
     if not message.reply_to_message or not message.reply_to_message.video:
-        return await message.reply("⚠️ Reply to a video with /encode")
+        await message.reply_text("⚠️ Reply to a video with /encode")
+        return
 
     video = message.reply_to_message.video
     filename = video.file_name or "video.mp4"
-    input_path = os.path.join("/tmp", filename)
-    output_path = os.path.join("/tmp", f"encoded_{filename}")
+    input_path = f"downloads/{filename}"
+    output_path = f"encoded_{filename}"
 
-    status = await message.reply("📥 Starting download...")
+    status_msg = await message.reply_text(f"📥 Starting download: {filename}")
+    await app.download_media(video, file_name=input_path)
 
-    async def dl_progress(current, total):
-        await progress_message(status, "Downloading", current, total, start, filename)
-
-    start = time.time()
-    await app.download_media(video, file_name=input_path, progress=dl_progress)
-
-    await status.edit_text(f"✅ Download complete: {filename}\n⚙️ Starting encode...")
-
-    async def enc_update(current, total, start_time):
-        await progress_message(status, "Encoding", current, total, start_time, filename)
-
-    ok = await encode_video(input_path, output_path, update_cb=enc_update)
-    if not ok:
-        return await status.edit_text("❌ Encoding failed.")
-
-    await status.edit_text("📤 Uploading...")
-    await app.send_document(
-        chat_id=message.chat.id,
-        document=output_path,
-        file_name=f"encoded_{filename}"
-    )
-    await status.edit_text("✅ Process complete!")
-
+    # Encoding auto after download
+    success = await encode_video(input_path, output_path, status_msg, filename)
+    if success:
+        await upload_file(output_path, status_msg, filename)
     os.remove(input_path)
     os.remove(output_path)
 
-# -------- Start --------
+
+@app.on_message(filters.command("cancel"))
+async def cancel_task(_, message: Message):
+    global cancel_flag
+    cancel_flag = True
+    await message.reply_text("🛑 Cancel requested.")
+
+
+@app.on_message(filters.command("skip"))
+async def skip_task(_, message: Message):
+    global skip_flag
+    skip_flag = True
+    await message.reply_text("⏭️ Skip requested.")
+
+
+@app.on_message(filters.command("start"))
+async def start_cmd(_, message: Message):
+    await message.reply_text("✅ Bot is running (Session Mode)")
+
+
 if __name__ == "__main__":
-    logging.info("Bot is running...")
+    print("Bot is running...")
+    scheduler = AsyncIOScheduler()
+    # Disabled SubsPlease auto fetch since JSON errors
+    # scheduler.add_job(fetch_subsplease, "interval", minutes=10)
+    scheduler.start()
     app.run()
