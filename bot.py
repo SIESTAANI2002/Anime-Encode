@@ -1,22 +1,23 @@
 import os
 import json
-import time
 import asyncio
+import aiohttp
+import aiofiles
 import subprocess
-import psutil
 from datetime import datetime
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-# ================= CONFIG =================
+# === CONFIG ===
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")  # Pyrogram string session
-CHAT_ID = int(os.getenv("CHAT_ID"))           # Target channel/group for auto upload
-
+SESSION_STRING = os.getenv("SESSION_STRING")  # Use your Pyrogram session string
+CHAT_ID = int(os.getenv("CHAT_ID"))
 DOWNLOAD_FOLDER = "downloads"
 ENCODED_FOLDER = "encoded"
 TRACK_FILE = "downloaded.json"
+SUBS_API_URL = "https://subsplease.org/api/?f=latest&tz=UTC"
+ENCODE_CHUNK = 1024*1024  # 1 MB per encode chunk for progress
 
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(ENCODED_FOLDER, exist_ok=True)
@@ -32,140 +33,157 @@ def save_tracked():
     with open(TRACK_FILE, "w") as f:
         json.dump(list(downloaded_episodes), f)
 
-# ================= BOT =================
-app = Client(
-    "anime_bot",
-    session_string=SESSION_STRING,
-    api_id=API_ID,
-    api_hash=API_HASH
-)
-
+# === TASK QUEUE ===
 task_queue = asyncio.Queue()
 current_task = None
-cancel_flag = False
 
-# ================= PROGRESS HELPERS =================
-def format_bytes(size):
-    for unit in ['B','KB','MB','GB','TB']:
-        if size < 1024:
-            return f"{size:.2f}{unit}"
-        size /= 1024
-    return f"{size:.2f}PB"
+# === Pyrogram client ===
+app = Client(
+    name="anime_bot",
+    session_string=SESSION_STRING,
+    api_id=API_ID,
+    api_hash=API_HASH,
+)
 
-def get_disk_info():
-    usage = psutil.disk_usage("/")
-    free = format_bytes(usage.free)
-    total = format_bytes(usage.total)
-    return free, total
+# === UTILITIES ===
+async def download_file(url, output_path, msg: Message):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            total = int(resp.headers.get("content-length", 0))
+            downloaded = 0
+            bar_length = 20
 
-def get_uptime(start_time):
-    return str(datetime.utcnow() - start_time).split('.')[0]
+            async with aiofiles.open(output_path, "wb") as f:
+                async for chunk in resp.content.iter_chunked(ENCODE_CHUNK):
+                    await f.write(chunk)
+                    downloaded += len(chunk)
+                    percent = downloaded / total * 100 if total else 0
+                    filled = int(bar_length * percent / 100)
+                    bar = "█"*filled + "▒"*(bar_length - filled)
+                    await msg.edit(f"""
+Name » {os.path.basename(output_path)}
+⌑ Task   » Downloading
+⌑ {bar} » {percent:.2f}%
+⌑ Done   : {downloaded/1024/1024:.2f}MB of {total/1024/1024:.2f}MB
+⌑ Speed  : TBD
+⌑ ETA    : TBD
+⌑ Past   : TBD
+""")
+    return output_path
 
-# Fancy progress bar text
-def make_progress_bar(done, total, length=20):
-    if total == 0:
-        percent = 0
-    else:
-        percent = done / total
-    filled = int(length * percent)
-    bar = '█' * filled + '▒' * (length - filled)
-    return f"{bar} » {percent*100:.2f}%"
+async def encode_video(input_path, output_path, msg: Message):
+    command = [
+        "ffmpeg",
+        "-i", input_path,
+        "-vf", "scale=-1:720",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-y",
+        output_path
+    ]
 
-# ================= TASK WORKER =================
-async def worker():
-    global current_task, cancel_flag
-    while True:
-        task = await task_queue.get()
-        current_task = task
-        cancel_flag = False
-        task_type, file_path, message = task
-
-        if task_type == "manual":
-            await handle_manual_encode(file_path, message)
-
-        elif task_type == "auto":
-            await handle_auto_download(file_path)
-
-        current_task = None
-        task_queue.task_done()
-
-# ================= MANUAL ENCODE =================
-async def handle_manual_encode(file_path, message: Message):
-    global cancel_flag
-    filename = os.path.basename(file_path)
-    out_file = os.path.join(ENCODED_FOLDER, filename)
-    
-    await message.reply(f"⌑ Task   » Encoding\n⌑ Name   » {filename}")
-
-    total_size = os.path.getsize(file_path)
-    chunk_size = 1024 * 1024  # 1MB
-
-    process = subprocess.Popen(
-        ["ffmpeg","-i", file_path,"-vf","scale=-1:720","-c:v","libx264","-preset","fast","-crf","23","-c:a","aac","-b:a","128k", out_file, "-y"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
         text=True
     )
 
-    for line in process.stdout:
-        if cancel_flag:
-            process.kill()
-            await message.reply("⚠️ Task cancelled!")
-            return
-        if "time=" in line:
-            # just a dummy example, replace with proper parsing
-            await message.edit(f"⌑ Encoding » {filename}\n⌑ {line.strip()}")
-            await asyncio.sleep(0.5)
+    while True:
+        line = await process.stderr.readline()
+        if not line:
+            break
+        if "frame=" in line or "time=" in line:
+            # Simple progress line, can be enhanced
+            await msg.edit(f"⌑ Encoding » {os.path.basename(input_path)}\n{line.strip()}")
+    await process.wait()
+    return output_path
 
-    await message.reply(f"✅ Encoding done: {filename}")
-    await app.send_document(message.chat.id, out_file)
-    os.remove(file_path)
-    os.remove(out_file)
+# === BOT COMMANDS ===
+@app.on_message(filters.command("encode") & filters.private)
+async def manual_encode(client, message: Message):
+    if not message.reply_to_message:
+        await message.reply("⚠️ Reply to a video/document with /encode")
+        return
+    await task_queue.put(("manual", message))
+    await message.reply("⏳ Added to encode queue")
 
-# ================= AUTO DOWNLOAD =================
-async def handle_auto_download(url):
-    # Implement your auto download and encode here, similar to manual
-    pass
+@app.on_message(filters.command("cancel") & filters.private)
+async def cancel_task(client, message: Message):
+    global task_queue
+    task_queue = asyncio.Queue()  # Clear queue
+    await message.reply("✅ All tasks cancelled")
 
-# ================= COMMANDS =================
-@app.on_message(filters.command("encode"))
-async def cmd_encode(client, message: Message):
-    if message.reply_to_message and (message.reply_to_message.document or message.reply_to_message.video):
-        file_path = await message.reply_to_message.download(DOWNLOAD_FOLDER)
-        await task_queue.put(("manual", file_path, message))
-        await message.reply(f"✅ Task added to queue: {os.path.basename(file_path)}")
-    else:
-        await message.reply("⚠️ Reply to a video or document to encode.")
-
-@app.on_message(filters.command("cancel"))
-async def cmd_cancel(client, message: Message):
-    global cancel_flag
+@app.on_message(filters.command("skip") & filters.private)
+async def skip_task(client, message: Message):
+    global current_task
     if current_task:
-        cancel_flag = True
-        await message.reply("⚠️ Current task will be cancelled.")
+        current_task.cancel()
+        await message.reply("⏩ Current task skipped")
     else:
-        await message.reply("⚠️ No task running now.")
+        await message.reply("⚠️ No task running")
 
-@app.on_message(filters.command("skip"))
-async def cmd_skip(client, message: Message):
-    if not task_queue.empty():
-        skipped = await task_queue.get()
-        await message.reply(f"⚠️ Skipped: {os.path.basename(skipped[1])}")
+# === AUTO MODE ===
+async def auto_mode():
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(SUBS_API_URL) as resp:
+                    data = await resp.json()
+                    for ep in data.get("data", []):
+                        title, url = ep["release_title"], ep["link"]
+                        if url not in downloaded_episodes:
+                            msg = await app.send_message(CHAT_ID, f"⬇️ Downloading {title}")
+                            file_path = os.path.join(DOWNLOAD_FOLDER, title + ".mkv")
+                            await download_file(url, file_path, msg)
+                            output_file = os.path.join(ENCODED_FOLDER, os.path.basename(file_path))
+                            await encode_video(file_path, output_file, msg)
+                            await app.send_document(CHAT_ID, output_file)
+                            os.remove(file_path)
+                            os.remove(output_file)
+                            downloaded_episodes.add(url)
+                            save_tracked()
+            await asyncio.sleep(600)  # 10 min
+        except Exception as e:
+            print("Auto mode error:", e)
+            await asyncio.sleep(60)
+
+# === WORKER ===
+async def worker():
+    global current_task
+    while True:
+        task_type, message = await task_queue.get()
+        current_task = asyncio.create_task(process_task(task_type, message))
+        try:
+            await current_task
+        except asyncio.CancelledError:
+            await message.reply("⏹ Task cancelled")
+        current_task = None
         task_queue.task_done()
-    else:
-        await message.reply("⚠️ No queued tasks.")
 
-# ================= MAIN =================
+async def process_task(task_type, message: Message):
+    if task_type == "manual":
+        replied = message.reply_to_message
+        file_path = await replied.download(file_name=os.path.join(DOWNLOAD_FOLDER, replied.document.file_name if replied.document else replied.video.file_name))
+        output_path = os.path.join(ENCODED_FOLDER, os.path.basename(file_path))
+        msg = await message.reply(f"⚙️ Download complete, starting encode for {os.path.basename(file_path)}")
+        await encode_video(file_path, output_path, msg)
+        await app.send_document(message.chat.id, output_path)
+        os.remove(file_path)
+        os.remove(output_path)
+        await msg.edit(f"✅ Done {os.path.basename(file_path)}")
+
+# === MAIN ===
 async def main():
-    start_time = datetime.utcnow()
     await app.start()
     print("Bot is running...")
-
-    # Start the worker
+    asyncio.create_task(auto_mode())
     asyncio.create_task(worker())
-
-    # Keep bot running
-    await app.idle()
+    while True:
+        await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(main())
+    asyncio.run(main())
