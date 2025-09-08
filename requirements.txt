@@ -9,3 +9,5 @@ python-decouple
 psutil
 pymediainfo
 ffmpeg-python
+aiohttp
+aiofiles
