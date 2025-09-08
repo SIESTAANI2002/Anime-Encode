@@ -11,3 +11,4 @@ pymediainfo
 ffmpeg-python
 aiohttp
 aiofiles
+python-dotenv
