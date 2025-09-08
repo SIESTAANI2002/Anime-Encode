@@ -1,19 +1,17 @@
 import os
 import json
 import time
-import math
 import threading
 import subprocess
 import requests
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait
 
 # === CONFIG ===
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")  # Pyrogram session string
-CHAT_ID = int(os.getenv("CHAT_ID"))
+SESSION_STRING = os.getenv("SESSION_STRING")
+CHAT_ID = int(os.getenv("CHAT_ID"))  # channel/group id
 DOWNLOAD_FOLDER = "downloads"
 ENCODED_FOLDER = "encoded"
 TRACK_FILE = "downloaded.json"
@@ -33,141 +31,132 @@ def save_tracked():
     with open(TRACK_FILE, "w") as f:
         json.dump(list(downloaded_episodes), f)
 
-# === Pyrogram client ===
-app = Client(
-    "anime_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING,
-    workdir="./"
-)
-
-# === Flood-safe edit ===
-def safe_edit(msg: Message, text: str):
-    try:
-        msg.edit(text)
-    except FloodWait as e:
-        print(f"Flood wait {e.x}s, sleeping...")
-        time.sleep(e.x)
-        msg.edit(text)
-    except:
-        pass
-
-# === Progress bar helpers ===
-def format_progress(current, total):
-    if total == 0:
-        return "0.00%"
+# === Progress Bar Helper ===
+def progress_bar(current, total, length=20):
+    filled = int(length * current // total)
+    empty = length - filled
     percent = current / total * 100
-    bar_length = 20
-    filled_len = int(bar_length * percent // 100)
-    bar = "█" * filled_len + "▒" * (bar_length - filled_len)
-    return f"{percent:.2f}% | {bar}"
+    return f"[{'█'*filled}{'▒'*empty}] {percent:.2f}%"
 
-def format_size(bytes):
-    if bytes < 1024:
-        return f"{bytes}B"
-    elif bytes < 1024**2:
-        return f"{bytes/1024:.2f}KB"
-    elif bytes < 1024**3:
-        return f"{bytes/1024**2:.2f}MB"
-    else:
-        return f"{bytes/1024**3:.2f}GB"
-
-# === Download & encode ===
-def download_file(url, output_path, progress_msg=None):
-    with requests.get(url, stream=True) as r:
-        total_length = int(r.headers.get("content-length", 0))
-        downloaded = 0
-        start_time = time.time()
-        chunk_size = 1024*1024  # 1MB
-        with open(output_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if progress_msg and time.time() - start_time > 20:  # 20s interval
-                        eta = (total_length - downloaded) / (downloaded / (time.time() - start_time + 0.1))
-                        text = f"Name » {os.path.basename(output_path)}\n" \
-                               f"⌑ Task » Downloading\n" \
-                               f"⌑ {format_progress(downloaded, total_length)}\n" \
-                               f"⌑ Done   : {format_size(downloaded)} of {format_size(total_length)}\n" \
-                               f"⌑ ETA    : {int(eta)}s"
-                        safe_edit(progress_msg, text)
-                        start_time = time.time()
-    return output_path
-
-def encode_video(input_path, output_path, progress_msg=None):
+# === Encode Function ===
+def encode_video(input_path, output_path, progress_callback=None):
+    import json
     ext = os.path.splitext(input_path)[1].lower()
     output_path = os.path.splitext(output_path)[0] + ext
+
+    probe_cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "a",
+        "-show_entries", "stream=index,codec_name",
+        "-of", "json", input_path
+    ]
+    result = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    audio_info = json.loads(result.stdout).get("streams", [])
+
     command = [
         "ffmpeg", "-i", input_path,
         "-vf", "scale=-1:720",
         "-c:v", "libx264",
         "-preset", "fast",
         "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        "-c:s", "copy",
-        "-y", output_path
+        "-c:s", "copy"
     ]
+
+    for stream in audio_info:
+        idx = stream["index"]
+        codec = stream["codec_name"].lower()
+        if codec == "aac":
+            command += [f"-c:a:{idx}", "aac", f"-b:a:{idx}", "128k"]
+        elif codec == "opus":
+            command += [f"-c:a:{idx}", "libopus", f"-b:a:{idx}", "128k"]
+        elif codec == "mp3":
+            command += [f"-c:a:{idx}", "libmp3lame", f"-b:a:{idx}", "128k"]
+        elif codec == "flac":
+            command += [f"-c:a:{idx}", "flac"]
+        else:
+            command += [f"-c:a:{idx}", "aac", f"-b:a:{idx}", "128k"]
+
+    command += ["-y", output_path]
+
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for line in process.stdout:
-        if progress_msg and "time=" in line:
-            safe_edit(progress_msg, f"Name » {os.path.basename(input_path)}\n⌑ Task » Encoding\n⌑ {line.strip()}")
+        if progress_callback and ("frame=" in line or "time=" in line):
+            progress_callback(line.strip())
     process.wait()
     return output_path
 
-# === SubsPlease auto download every 10min ===
-def auto_mode(client: Client):
-    while True:
-        try:
-            res = requests.get(SUBS_API_URL, timeout=15)
-            try:
-                releases = res.json().get("data", [])
-            except:
-                print("⚠️ SubsPlease returned non-JSON, retrying in 60s")
-                time.sleep(60)
-                continue
-            for ep in releases:
-                title = ep["release_title"]
-                url = ep["link"]
-                if url not in downloaded_episodes:
-                    file_path = os.path.join(DOWNLOAD_FOLDER, title + ".mkv")
-                    progress_msg = client.send_message(CHAT_ID, f"Starting download: {title}")
-                    download_file(url, file_path, progress_msg=progress_msg)
-                    # auto encode
-                    output_file = os.path.join(ENCODED_FOLDER, os.path.basename(file_path))
-                    encode_video(file_path, output_file, progress_msg=progress_msg)
-                    # upload
-                    client.send_document(CHAT_ID, output_file)
-                    os.remove(file_path)
-                    os.remove(output_file)
-                    downloaded_episodes.add(url)
-                    save_tracked()
-            time.sleep(600)  # 10 min interval
-        except Exception as e:
-            print("Auto mode error:", e)
-            time.sleep(60)
+# === SubsPlease Auto Download ===
+def get_recent_releases():
+    releases = []
+    try:
+        res = requests.get(SUBS_API_URL, timeout=15)
+        data = res.json()
+        for ep in data.get("data", []):
+            title = ep["release_title"]
+            link = ep["link"]
+            releases.append((title, link))
+    except Exception as e:
+        print("SubsPlease returned non-JSON, retrying in 60s")
+    return releases
 
-# === Handle manual encode ===
+def download_file(url, output_path, progress_callback=None):
+    r = requests.get(url, stream=True)
+    total = int(r.headers.get('content-length', 0))
+    downloaded = 0
+    last_update = time.time()
+    with open(output_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024*1024):  # 1MB chunks
+            if chunk:
+                f.write(chunk)
+                downloaded += len(chunk)
+                now = time.time()
+                if progress_callback and (now - last_update > 5):  # update every 5s
+                    last_update = now
+                    progress_callback(downloaded, total)
+    return output_path
+
+# === Pyrogram Client ===
+app = Client(name="anime_bot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
 pending_videos = {}
 
 @app.on_message(filters.video | filters.document)
 def handle_video(client, message: Message):
     file_name = message.document.file_name if message.document else message.video.file_name
     file_path = os.path.join(DOWNLOAD_FOLDER, file_name)
-    progress_msg = message.reply(f"Starting download: {file_name}")
-    message.download(file_path)
-    pending_videos[message.message_id] = (file_path, progress_msg)
-    # auto encode
-    output_path = os.path.join(ENCODED_FOLDER, os.path.basename(file_path))
-    encode_video(file_path, output_path, progress_msg=progress_msg)
-    client.send_document(message.chat.id, output_path)
-    os.remove(file_path)
-    os.remove(output_path)
-    pending_videos.pop(message.message_id, None)
+    progress_msg = message.reply(f"⌑ Task   » Downloading\n⌑ {file_name}\n⌑ 0%")
+    
+    def download_progress(downloaded, total):
+        progress = progress_bar(downloaded, total)
+        progress_msg.edit_text(f"⌑ Task   » Downloading\n⌑ {file_name}\n⌑ {progress}")
+    
+    download_file(message.download(file_path), file_path, progress_callback=download_progress)
+    
+    # Auto start encoding
+    pending_videos[message.id] = (file_path, progress_msg)
+    encode_command(client, message)
+
+@app.on_message(filters.command("encode"))
+def encode_command(client, message: Message):
+    if message.reply_to_message:
+        orig_msg_id = message.reply_to_message.id
+        if orig_msg_id not in pending_videos:
+            message.reply("⚠️ File not found. Make sure the video is fully uploaded/downloaded.")
+            return
+        input_path, progress_msg = pending_videos.pop(orig_msg_id)
+        output_path = os.path.join(ENCODED_FOLDER, os.path.basename(input_path))
+
+        def encoding_progress(line):
+            progress_msg.edit_text(f"⌑ Task   » Encoding\n⌑ {os.path.basename(input_path)}\n⌑ {line}")
+
+        encode_video(input_path, output_path, progress_callback=encoding_progress)
+        progress_msg.edit_text(f"✅ Finished Encoding: {os.path.basename(input_path)}")
+        client.send_document(message.chat.id, output_path)
+
+        os.remove(input_path)
+        os.remove(output_path)
+    else:
+        message.reply("Reply to a video/document with /encode to process it.")
 
 # === Run Bot ===
 if __name__ == "__main__":
-    threading.Thread(target=auto_mode, args=(app,), daemon=True).start()
     print("Bot is running...")
     app.run()
