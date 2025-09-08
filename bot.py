@@ -11,17 +11,16 @@ from pyrogram.types import Message
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
-CHAT_ID = int(os.getenv("CHAT_ID"))
+CHAT_ID = int(os.getenv("CHAT_ID"))  # Target channel/group
 DOWNLOAD_FOLDER = "downloads"
 ENCODED_FOLDER = "encoded"
 TRACK_FILE = "downloaded.json"
 SUBS_API_URL = "https://subsplease.org/api/?f=latest&tz=UTC"
-FFMPEG_BIN = "./ffmpeg"  # Push ffmpeg binary in repo
 
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(ENCODED_FOLDER, exist_ok=True)
 
-# === Load tracked episodes ===
+# Load tracked episodes
 if os.path.exists(TRACK_FILE):
     with open(TRACK_FILE, "r") as f:
         downloaded_episodes = set(json.load(f))
@@ -32,170 +31,167 @@ def save_tracked():
     with open(TRACK_FILE, "w") as f:
         json.dump(list(downloaded_episodes), f)
 
-# === Queue ===
+# Queue system
 task_queue = []
 current_task = None
 cancel_flag = False
 
-# === Fancy progress bar ===
+# === Helper Functions ===
 def progress_bar(percent, length=20):
-    done = int(length * percent // 100)
-    return f"[{'█'*done}{'▒'*(length-done)}] {percent:.2f}%"
+    done_len = int(length * percent // 100)
+    bar = "█" * done_len + "▒" * (length - done_len)
+    return f"[{bar}] {percent:.1f}%"
 
-# === Video Encoder ===
-def encode_video(input_path, output_path, msg, stage="Encoding"):
-    global cancel_flag
+def run_ffmpeg(input_path, output_path, progress_callback=None):
     cmd = [
-        FFMPEG_BIN, "-i", input_path,
+        "ffmpeg", "-i", input_path,
         "-vf", "scale=-1:720",
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-b:a", "128k",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
         "-c:s", "copy",
         "-y", output_path
     ]
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    total_time = None
     for line in process.stdout:
-        if cancel_flag:
-            process.kill()
-            msg.edit("❌ Task canceled.")
-            return None
-        if "time=" in line:
-            try:
-                time_str = line.split("time=")[1].split(" ")[0]
-                h, m, s = map(float, time_str.split(":"))
-                elapsed_sec = int(h*3600 + m*60 + s)
-                if total_time:
-                    percent = min(100, (elapsed_sec/total_time)*100)
-                    msg.edit(f"⌑ {stage} » {progress_bar(percent)} {elapsed_sec//60:02}:{elapsed_sec%60:02}")
-            except:
-                pass
-        if "Duration" in line and total_time is None:
-            try:
-                dur_str = line.split("Duration:")[1].split(",")[0].strip()
-                h, m, s = map(float, dur_str.split(":"))
-                total_time = int(h*3600 + m*60 + s)
-            except:
-                pass
+        if progress_callback:
+            progress_callback(line)
     process.wait()
-    return output_path
 
-# === Download Function ===
-def download_file(url, output_path, msg=None):
-    global cancel_flag
-    with requests.get(url, stream=True) as r:
-        total = int(r.headers.get('content-length', 0))
-        downloaded = 0
-        with open(output_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if cancel_flag:
-                    msg.edit("❌ Task canceled during download.")
-                    return None
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if msg:
-                        percent = (downloaded/total)*100 if total else 0
-                        msg.edit(f"⌑ Downloading » {progress_bar(percent)} {downloaded//1024}KB / {total//1024 if total else '?'}KB")
-    return output_path
+def download_file(url, dest, progress_callback=None):
+    r = requests.get(url, stream=True)
+    total = int(r.headers.get("content-length", 0))
+    downloaded = 0
+    chunk_size = 8192
+    for chunk in r.iter_content(chunk_size=chunk_size):
+        if chunk:
+            dest.write(chunk)
+            downloaded += len(chunk)
+            if progress_callback and total:
+                percent = downloaded / total * 100
+                progress_callback(percent, downloaded, total)
 
-# === Auto mode ===
+# === Auto Download Thread ===
 def auto_mode(client: Client):
+    global task_queue
     while True:
         try:
-            recent = requests.get(SUBS_API_URL, timeout=15).json().get("data", [])
-            for ep in recent:
-                title = ep["release_title"]
-                link = ep["link"]
-                if link not in downloaded_episodes:
-                    task_queue.append({"type": "subs", "title": title, "url": link})
-            time.sleep(600)  # 10 min
+            res = requests.get(SUBS_API_URL, timeout=15).json()
+            for ep in res.get("data", []):
+                title, url = ep["release_title"], ep["link"]
+                if url not in downloaded_episodes:
+                    file_ext = os.path.splitext(url)[1]
+                    file_path = os.path.join(DOWNLOAD_FOLDER, title + file_ext)
+                    task_queue.append({
+                        "type": "auto",
+                        "title": title,
+                        "url": url,
+                        "file_path": file_path,
+                        "chat_id": CHAT_ID
+                    })
+            time.sleep(600)  # every 10 minutes
         except Exception as e:
             print("Auto mode error:", e)
             time.sleep(60)
 
 # === Task Processor ===
-def process_queue(client: Client):
-    global current_task, cancel_flag
+def process_tasks(client: Client):
+    global task_queue, current_task, cancel_flag
     while True:
-        if not current_task and task_queue:
+        if task_queue and not current_task:
             current_task = task_queue.pop(0)
             cancel_flag = False
             title = current_task.get("title")
+            chat_id = current_task.get("chat_id")
+            file_path = current_task.get("file_path")
             url = current_task.get("url")
-            media_msg = current_task.get("media_msg")
-            msg = None
+
             try:
-                if current_task["type"] == "subs":
-                    file_path = f"{DOWNLOAD_FOLDER}/{title}.mkv"
-                    msg = client.send_message(CHAT_ID, f"⬇️ Downloading {title}")
-                    download_file(url, file_path, msg)
-                    output_path = f"{ENCODED_FOLDER}/{title}.mkv"
-                    encode_video(file_path, output_path, msg)
-                    client.send_document(CHAT_ID, output_path)
-                    os.remove(file_path)
-                    os.remove(output_path)
-                    downloaded_episodes.add(url)
-                    save_tracked()
-                elif current_task["type"] == "manual":
-                    file_name = media_msg.document.file_name if media_msg.document else media_msg.video.file_name
-                    file_path = f"{DOWNLOAD_FOLDER}/{file_name}"
-                    msg = client.send_message(media_msg.chat.id, f"⬇️ Downloading {file_name}")
-                    media_msg.download(file_path)
-                    output_path = f"{ENCODED_FOLDER}/{file_name}"
-                    encode_video(file_path, output_path, msg)
-                    client.send_document(media_msg.chat.id, output_path)
-                    os.remove(file_path)
-                    os.remove(output_path)
+                # Download
+                msg = client.send_message(chat_id, f"⬇️ Downloading: {title}")
+                with open(file_path, "wb") as f:
+                    download_file(url, f, progress_callback=lambda p, d, t: msg.edit(
+                        f"⬇️ Downloading: {title}\n{progress_bar(p)} {d/1024/1024:.2f}MB/{t/1024/1024:.2f}MB"
+                    ))
+                    if cancel_flag: raise Exception("Cancelled")
+
+                # Encode
+                output_path = os.path.join(ENCODED_FOLDER, os.path.basename(file_path))
+                msg.edit(f"⚙️ Encoding: {title}")
+                run_ffmpeg(file_path, output_path, progress_callback=lambda l: None)
+                if cancel_flag: raise Exception("Cancelled")
+
+                # Upload
+                client.send_document(chat_id, output_path, caption=f"✅ Done: {title}")
+
+                # Cleanup
+                os.remove(file_path)
+                os.remove(output_path)
+                downloaded_episodes.add(url)
+                save_tracked()
             except Exception as e:
-                if msg:
-                    msg.edit(f"❌ Error: {e}")
-            current_task = None
+                client.send_message(chat_id, f"⚠️ Task failed: {title}\n{e}")
+            finally:
+                current_task = None
         else:
             time.sleep(5)
 
 # === Pyrogram Client ===
-app = Client("anime_bot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
+app = Client(
+    name="anime_bot",
+    session_string=SESSION_STRING,
+    api_id=API_ID,
+    api_hash=API_HASH
+)
 
-@app.on_message(filters.video | filters.document)
-def handle_video(client, message: Message):
-    task_queue.append({"type": "manual", "media_msg": message})
-    message.reply("✅ Added to queue for download & encoding.")
+# === Manual Encoding Command ===
+@app.on_message(filters.command("encode") & filters.reply)
+def manual_encode(client: Client, message: Message):
+    global task_queue
+    reply = message.reply_to_message
+    if not reply or not (reply.video or reply.document):
+        message.reply("⚠️ Reply to a video/document to encode.")
+        return
 
-@app.on_message(filters.command(["cancel"]))
-def cancel_task(client, message: Message):
+    file_name = reply.video.file_name if reply.video else reply.document.file_name
+    file_path = os.path.join(DOWNLOAD_FOLDER, file_name)
+    reply.download(file_path)
+    task_queue.append({
+        "type": "manual",
+        "title": file_name,
+        "url": None,
+        "file_path": file_path,
+        "chat_id": message.chat.id
+    })
+    message.reply(f"✅ Added {file_name} to encoding queue.")
+
+# === /cancel /skip /queue Commands ===
+@app.on_message(filters.command("cancel"))
+def cancel_task(client: Client, message: Message):
     global cancel_flag
-    if current_task:
-        cancel_flag = True
-        message.reply("⚠️ Current task will be canceled.")
-    else:
-        message.reply("❌ No running task.")
+    cancel_flag = True
+    message.reply("⛔ Current task will be cancelled.")
 
-@app.on_message(filters.command(["skip"]))
-def skip_task(client, message: Message):
+@app.on_message(filters.command("skip"))
+def skip_task(client: Client, message: Message):
     global current_task
     if current_task:
         cancel_flag = True
-        message.reply("⚠️ Skipping current task.")
+        message.reply(f"⏭ Skipping: {current_task.get('title')}")
     else:
-        message.reply("❌ No running task.")
+        message.reply("⚠️ No task to skip.")
 
-@app.on_message(filters.command(["queue"]))
-def show_queue(client, message: Message):
-    if task_queue:
-        text = "📃 Current Queue:\n"
-        for i, t in enumerate(task_queue, 1):
-            text += f"{i}. {t.get('title') or (t['media_msg'].document.file_name if t['media_msg'].document else t['media_msg'].video.file_name)}\n"
-        message.reply(text)
+@app.on_message(filters.command("queue"))
+def show_queue(client: Client, message: Message):
+    global task_queue
+    if not task_queue:
+        message.reply("📭 Queue is empty.")
     else:
-        message.reply("✅ Queue is empty.")
-
-# === Start Threads ===
-threading.Thread(target=auto_mode, args=(app,), daemon=True).start()
-threading.Thread(target=process_queue, args=(app,), daemon=True).start()
+        txt = "📋 Current Queue:\n" + "\n".join(f"{i+1}. {t.get('title')}" for i, t in enumerate(task_queue))
+        message.reply(txt)
 
 # === Run Bot ===
-app.run()
+if __name__ == "__main__":
+    with app:
+        threading.Thread(target=auto_mode, args=(app,), daemon=True).start()
+        threading.Thread(target=process_tasks, args=(app,), daemon=True).start()
+        app.run()
