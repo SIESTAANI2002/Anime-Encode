@@ -1,19 +1,19 @@
 import os
-import time
 import json
-import stat
-import asyncio
-import requests
+import time
 import threading
 import subprocess
+import requests
+import shutil
+from datetime import timedelta
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 # === CONFIG ===
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")  # Your Pyrogram session string
-CHAT_ID = int(os.getenv("CHAT_ID"))           # Your chat id
+SESSION_STRING = os.getenv("SESSION_STRING")
+CHAT_ID = int(os.getenv("CHAT_ID"))  # your channel/group ID
 DOWNLOAD_FOLDER = "downloads"
 ENCODED_FOLDER = "encoded"
 TRACK_FILE = "downloaded.json"
@@ -34,162 +34,165 @@ def save_tracked():
         json.dump(list(downloaded_episodes), f)
 
 # === FFMPEG SETUP ===
-FFMPEG_DIR = "bin"
-FFMPEG_BIN = os.path.join(FFMPEG_DIR, "ffmpeg")
-FFPROBE_BIN = os.path.join(FFMPEG_DIR, "ffprobe")
-os.makedirs(FFMPEG_DIR, exist_ok=True)
-
-if not os.path.exists(FFMPEG_BIN) or not os.path.exists(FFPROBE_BIN):
-    print("⬇️ Downloading static ffmpeg...")
-    url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
-    r = requests.get(url, stream=True)
-    archive_path = os.path.join(FFMPEG_DIR, "ffmpeg.tar.xz")
-    with open(archive_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=8192):
-            if chunk:
-                f.write(chunk)
+FFMPEG_BIN = "ffmpeg"
+if not shutil.which(FFMPEG_BIN):
+    # Download static ffmpeg
+    import urllib.request
     import tarfile
-    with tarfile.open(archive_path, "r:xz") as tar:
-        for member in tar.getmembers():
-            if "ffmpeg" in member.name or "ffprobe" in member.name:
-                member.name = os.path.basename(member.name)
-                tar.extract(member, FFMPEG_DIR)
-    os.remove(archive_path)
-    os.chmod(FFMPEG_BIN, stat.S_IRWXU)
-    os.chmod(FFPROBE_BIN, stat.S_IRWXU)
-print("✅ FFMPEG ready")
+    print("⬇️ Downloading static FFMPEG...")
+    url = "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-i686-static.tar.xz"
+    urllib.request.urlretrieve(url, "ffmpeg.tar.xz")
+    with tarfile.open("ffmpeg.tar.xz") as tar:
+        tar.extractall()
+    ffmpeg_dir = [d for d in os.listdir() if "ffmpeg-" in d][0]
+    FFMPEG_BIN = os.path.join(ffmpeg_dir, "ffmpeg")
+    print("✅ FFMPEG ready")
 
-# === QUEUE ===
-task_queue = asyncio.Queue()
+# === Pyrogram Client ===
+app = Client("anime_bot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
+
+# === Task Queue ===
+task_queue = []
 current_task = None
 cancel_flag = False
+skip_flag = False
 
-# === CLIENT ===
-app = Client(name="anime_bot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
+def fancy_progress(done, total, prefix="", length=20):
+    percent = done / total if total else 0
+    filled = int(length * percent)
+    bar = "█" * filled + "▒" * (length - filled)
+    eta = str(timedelta(seconds=int((total - done) / max(0.0001, 1))))
+    return f"{prefix} » {bar} {percent*100:.2f}% | {done}/{total} | ETA: {eta}"
 
-# === UTILITIES ===
-def fancy_progress_bar(prefix, transferred, total, speed, eta, done_label="Done"):
-    percent = (transferred / total) * 100 if total else 0
-    filled_len = int(10 * percent // 100)
-    bar = "█" * filled_len + "▒" * (10 - filled_len)
-    return (
-        f"{prefix}\n"
-        f"⌑ {bar} » {percent:.2f}%\n"
-        f"⌑ {done_label} : {transferred / 1024 / 1024:.2f}MB of {total / 1024 / 1024:.2f}MB\n"
-        f"⌑ Speed : {speed/1024:.2f} KB/s | ETA : {eta}s"
-    )
-
-def download_file(url, output_path, message: Message):
-    r = requests.get(url, stream=True)
-    total = int(r.headers.get("content-length", 0))
-    chunk_size = 8192
-    downloaded = 0
-    start_time = time.time()
-    for chunk in r.iter_content(chunk_size=chunk_size):
-        if chunk:
-            with open(output_path, "ab") as f:
-                f.write(chunk)
-            downloaded += len(chunk)
-            elapsed = max(time.time() - start_time, 1)
-            speed = downloaded / elapsed
-            eta = int((total - downloaded) / speed) if speed > 0 else 0
-            text = fancy_progress_bar("Downloading", downloaded, total, speed, eta)
-            try: message.edit(text)
-            except: pass
-            global cancel_flag
-            if cancel_flag:
-                cancel_flag = False
-                return False
-    return True
-
-def encode_video(input_path, output_path, message: Message):
-    import json
-    ext = os.path.splitext(input_path)[1].lower()
-    output_path = os.path.splitext(output_path)[0] + ext
-    # Audio streams
-    probe_cmd = [
-        FFPROBE_BIN, "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=index,codec_name",
-        "-of", "json", input_path
-    ]
-    result = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    audio_info = json.loads(result.stdout).get("streams", [])
-    command = [
-        FFMPEG_BIN, "-i", input_path,
-        "-vf", "scale=-1:720",
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
-        "-c:s", "copy"
-    ]
-    for stream in audio_info:
-        idx = stream["index"]
-        codec = stream["codec_name"].lower()
-        if codec == "aac":
-            command += [f"-c:a:{idx}", "aac", f"-b:a:{idx}", "128k"]
-        elif codec == "opus":
-            command += [f"-c:a:{idx}", "libopus", f"-b:a:{idx}", "128k"]
-        elif codec == "mp3":
-            command += [f"-c:a:{idx}", "libmp3lame", f"-b:a:{idx}", "128k"]
-        elif codec == "flac":
-            command += [f"-c:a:{idx}", "flac"]
-        else:
-            command += [f"-c:a:{idx}", "aac", f"-b:a:{idx}", "128k"]
-    command += ["-y", output_path]
-
+def encode_video(input_path, output_path, msg: Message):
+    command = [FFMPEG_BIN, "-i", input_path, "-vf", "scale=-1:720",
+               "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+               "-c:a", "aac", "-b:a", "128k", "-c:s", "copy", "-y", output_path]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for line in process.stdout:
         if "frame=" in line or "time=" in line:
             try:
-                message.edit(f"Encoding...\n{line.strip()}")
+                msg.edit_text(f"⚙️ Encoding: {line.strip()}")
             except: pass
-        global cancel_flag
-        if cancel_flag:
-            process.kill()
-            cancel_flag = False
-            return False
     process.wait()
     return output_path
 
-# === MANUAL ENCODE ===
-pending_videos = {}
+def download_file(url, output_path, msg: Message):
+    r = requests.get(url, stream=True)
+    total = int(r.headers.get("content-length", 0))
+    done = 0
+    chunk_size = 8192
+    for chunk in r.iter_content(chunk_size=chunk_size):
+        if cancel_flag or skip_flag:
+            break
+        if chunk:
+            done += len(chunk)
+            with open(output_path, "ab") as f:
+                f.write(chunk)
+            try:
+                msg.edit_text(f"⬇️ Downloading {os.path.basename(output_path)}\n" +
+                              fancy_progress(done, total, prefix="Progress"))
+            except: pass
+    return output_path
 
-@app.on_message(filters.video | filters.document)
-def handle_video(client, message: Message):
-    file_name = message.document.file_name if message.document else message.video.file_name
-    file_path = os.path.join(DOWNLOAD_FOLDER, file_name)
-    message.download(file_path)
-    pending_videos[message.id] = file_path
-    message.reply(f"✅ Saved {file_name}. Reply with /encode to process.")
+def process_task(task):
+    global current_task, cancel_flag, skip_flag
+    current_task = task
+    cancel_flag = False
+    skip_flag = False
 
-@app.on_message(filters.command("encode"))
-def encode_command(client, message: Message):
-    if not message.reply_to_message:
-        message.reply("Reply to a video/document with /encode to process it.")
-        return
-    orig_id = message.reply_to_message.id
-    if orig_id not in pending_videos:
-        message.reply("⚠️ File not found. Make sure the video is fully uploaded/downloaded.")
-        return
-    input_path = pending_videos[orig_id]
-    output_path = os.path.join(ENCODED_FOLDER, os.path.basename(input_path))
-    message.reply(f"⚙️ Encoding {os.path.basename(input_path)}...")
-    encode_video(input_path, output_path, message)
-    message.reply(f"✅ Done {os.path.basename(input_path)}")
-    client.send_document(message.chat.id, output_path)
-    os.remove(input_path)
-    os.remove(output_path)
-    pending_videos.pop(orig_id, None)
+    message = task["message"]
+    file_path = task["file_path"]
+    output_path = os.path.join(ENCODED_FOLDER, os.path.basename(file_path))
 
-# === AUTO DOWNLOAD + ENCODE ===
-def get_recent_releases():
-    releases = []
     try:
-        res = requests.get(SUBS_API_URL, timeout=15).json()
-        for ep in res.get("data", []):
-            title = ep["release_title"]
-            link = ep["link"]
-            releases.append((title, link))
+        # Download if needed
+        if task.get("url"):
+            download_file(task["url"], file_path, message)
+
+        # Encode
+        encode_video(file_path, output_path, message)
+
+        # Upload
+        message.edit_text(f"📤 Uploading {os.path.basename(output_path)}")
+        app.send_document(CHAT_ID, output_path)
     except Exception as e:
-        print("SubsPlease API error:", e)
-    return
+        message.edit_text(f"❌ Error: {e}")
+
+    # Cleanup
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    current_task = None
+    if task_queue:
+        next_task = task_queue.pop(0)
+        threading.Thread(target=process_task, args=(next_task,)).start()
+
+# === Commands ===
+@app.on_message(filters.command("cancel"))
+def cancel_current(client, message: Message):
+    global cancel_flag
+    if current_task:
+        cancel_flag = True
+        message.reply("🛑 Current task cancelled")
+    else:
+        message.reply("No task is running.")
+
+@app.on_message(filters.command("skip"))
+def skip_current(client, message: Message):
+    global skip_flag
+    if current_task:
+        skip_flag = True
+        message.reply("⏭️ Current task skipped")
+    else:
+        message.reply("No task is running.")
+
+@app.on_message(filters.command("queue"))
+def show_queue(client, message: Message):
+    if task_queue:
+        queue_text = "\n".join([f"{i+1}. {os.path.basename(t['file_path'])}" for i, t in enumerate(task_queue)])
+        message.reply(f"📝 Queue:\n{queue_text}")
+    else:
+        message.reply("Queue is empty.")
+
+# === Manual /encode ===
+@app.on_message(filters.command("encode") & filters.reply)
+def encode_command(client, message: Message):
+    if message.reply_to_message:
+        media_msg = message.reply_to_message
+        file_path = f"downloads/{media_msg.document.file_name if media_msg.document else media_msg.video.file_name}"
+        media_msg.download(file_path)
+        task = {"message": message, "file_path": file_path}
+        if current_task is None:
+            threading.Thread(target=process_task, args=(task,)).start()
+        else:
+            task_queue.append(task)
+            message.reply("✅ Added to queue")
+
+# === Auto-download from SubsPlease ===
+def auto_mode():
+    while True:
+        try:
+            res = requests.get(SUBS_API_URL, timeout=15).json()
+            for ep in res.get("data", []):
+                title, url = ep["release_title"], ep["link"]
+                if url not in downloaded_episodes:
+                    file_path = os.path.join(DOWNLOAD_FOLDER, title + os.path.splitext(url)[1])
+                    task = {"message": None, "file_path": file_path, "url": url}
+                    if current_task is None:
+                        threading.Thread(target=process_task, args=(task,)).start()
+                    else:
+                        task_queue.append(task)
+                    downloaded_episodes.add(url)
+                    save_tracked()
+            time.sleep(600)  # 10 minutes
+        except Exception as e:
+            print("Auto mode error:", e)
+            time.sleep(60)
+
+# === Run Bot ===
+if __name__ == "__main__":
+    threading.Thread(target=auto_mode, daemon=True).start()
+    app.run()
