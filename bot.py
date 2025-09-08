@@ -3,9 +3,9 @@ import json
 import time
 import asyncio
 import subprocess
+import feedparser
 from pyrogram import Client, filters
 from pyrogram.types import Message
-import feedparser
 
 # === CONFIG ===
 API_ID = int(os.getenv("API_ID"))
@@ -28,67 +28,109 @@ if os.path.exists(TRACK_FILE):
 else:
     downloaded_episodes = set()
 
+
 def save_tracked():
     with open(TRACK_FILE, "w") as f:
         json.dump(list(downloaded_episodes), f)
+
 
 # === PROGRESS BAR ===
 def get_progress_bar(current, total, length=20):
     filled = int(length * current / total)
     bar = "█" * filled + "▒" * (length - filled)
-    percent = current / total * 100
+    percent = current / total * 100 if total else 0
     return f"{bar} » {percent:.2f}%"
 
-# === VIDEO ENCODE ===
-def encode_video(input_path, output_path, msg: Message = None):
+
+# === DOWNLOAD FUNCTION ===
+async def download_file(client, media, filename, msg: Message):
+    path = os.path.join(DOWNLOAD_FOLDER, filename)
+    start_time = time.time()
+
+    async for progress in client.download_media(
+        media,
+        file_name=path,
+        progress=lambda d, t: asyncio.create_task(update_progress(msg, filename, d, t, start_time))
+    ):
+        pass
+    return path
+
+
+async def update_progress(msg, filename, downloaded, total, start_time):
+    elapsed = time.time() - start_time
+    speed = downloaded / elapsed / 1024 / 1024
+    eta = (total - downloaded) / (downloaded / elapsed) if downloaded else 0
+    bar = get_progress_bar(downloaded, total)
+    text = (f"Filename : {filename}\n"
+            f"Downloading: {bar}\n"
+            f"Done   : {downloaded / 1024 / 1024:.2f}MB of {total / 1024 / 1024:.2f}MB\n"
+            f"Speed  : {speed:.2f}MB/s\n"
+            f"ETA    : {eta:.0f}s\n"
+            f"Elapsed: {elapsed:.0f}s")
+    try:
+        await msg.edit(text)
+    except:
+        pass
+
+
+# === ENCODE FUNCTION ===
+def encode_video(input_path, output_path):
     ext = os.path.splitext(input_path)[1].lower()
     output_path = os.path.splitext(output_path)[0] + ext
-
-    cmd = [
+    command = [
         "ffmpeg", "-i", input_path,
         "-vf", "scale=-1:720",
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-c:a", "aac", "-b:a", "128k",
         "-y", output_path
     ]
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-
-    for line in process.stdout:
-        if "time=" in line and msg:
-            time_str = line[line.find("time=")+5:line.find(" bitrate")]
-            text = f"⚙️ Encoding... {time_str}\nFile: {os.path.basename(input_path)}"
-            try:
-                asyncio.run_coroutine_threadsafe(msg.edit(text), asyncio.get_event_loop())
-            except:
-                pass
-    process.wait()
+    subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return output_path
+
 
 # === PYROGRAM CLIENT ===
 app = Client(name="anime_userbot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
 pending_videos = {}
 
-# === HANDLE TELEGRAM FILES ===
+
 @app.on_message(filters.video | filters.document)
 async def handle_video(client, message: Message):
     file_name = message.document.file_name if message.document else message.video.file_name
     msg = await message.reply(f"⬇️ Downloading {file_name}...")
-    
-    # Download using Pyrogram
-    path = await client.download_media(message, file_name=os.path.join(DOWNLOAD_FOLDER, file_name))
+    path = await download_file(client, message, file_name, msg)
     pending_videos[message.id] = path
 
     # Auto encode after download
     out_file = os.path.join(ENCODED_FOLDER, os.path.basename(path))
     await msg.edit(f"⚙️ Encoding {file_name}...")
-    encode_video(path, out_file, msg)
-
+    encode_video(path, out_file)
     await msg.edit(f"✅ Finished {file_name}, uploading...")
     await client.send_document(message.chat.id, out_file)
 
     os.remove(path)
     os.remove(out_file)
     pending_videos.pop(message.id, None)
+
+
+@app.on_message(filters.command("encode"))
+async def encode_command(client, message: Message):
+    if message.reply_to_message:
+        orig_id = message.reply_to_message.id
+        if orig_id not in pending_videos:
+            await message.reply("⚠️ File not found, please upload it again.")
+            return
+        input_path = pending_videos[orig_id]
+        out_file = os.path.join(ENCODED_FOLDER, os.path.basename(input_path))
+        await message.reply(f"⚙️ Encoding {os.path.basename(input_path)}...")
+        encode_video(input_path, out_file)
+        await message.reply(f"✅ Done {os.path.basename(input_path)}")
+        await client.send_document(message.chat.id, out_file)
+        os.remove(input_path)
+        os.remove(out_file)
+        pending_videos.pop(orig_id, None)
+    else:
+        await message.reply("Reply to a video/document with /encode to process it.")
+
 
 # === SUBSPLEASE AUTO-DOWNLOAD ===
 async def fetch_subsplease():
@@ -100,12 +142,21 @@ async def fetch_subsplease():
         for entry in feed.entries:
             title = entry.title
             link = entry.link
+
+            # Skip non-http links
+            if not link.startswith("http"):
+                print(f"⚠️ Skipping non-HTTP link: {link}")
+                continue
+
             if link in downloaded_episodes:
                 continue
-            print(f"⬇️ Auto download: {title} -> {link}")
+
+            print(f"⬇️ Auto download: {title}")
             filename = f"{title}.mkv"
-            path = await app.download_media(link, file_name=os.path.join(DOWNLOAD_FOLDER, filename))
+            msg = await app.send_message(CHAT_ID, f"⬇️ {filename}")
+            path = await download_file(app, link, filename, msg)
             out_file = os.path.join(ENCODED_FOLDER, filename)
+            await msg.edit(f"⚙️ Encoding {filename}...")
             encode_video(path, out_file)
             await app.send_document(CHAT_ID, out_file)
             os.remove(path)
@@ -115,18 +166,16 @@ async def fetch_subsplease():
     except Exception as e:
         print("SubsPlease auto error:", e)
 
+
 # === RUN BOT ===
 async def main():
-    # Run SubsPlease auto-download every 10 minutes
-    async def scheduler():
-        while True:
-            await fetch_subsplease()
-            await asyncio.sleep(600)
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(fetch_subsplease, "interval", minutes=10)
+    scheduler.start()
 
-    asyncio.create_task(scheduler())
     await app.start()
     print("🚀 Bot is running...")
-    await asyncio.Event().wait()  # keep running
+    await asyncio.Event().wait()  # Keep running
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())
