@@ -8,3 +8,4 @@ lxml[html_clean]
 python-decouple
 psutil
 pymediainfo
+ffmpeg-python
