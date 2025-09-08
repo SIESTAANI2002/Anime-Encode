@@ -13,3 +13,4 @@ aiohttp
 aiofiles
 python-dotenv
 apscheduler
+feedparser
