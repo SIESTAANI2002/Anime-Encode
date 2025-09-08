@@ -1,26 +1,27 @@
 import os
 import json
 import time
+import math
 import threading
 import subprocess
 import requests
-from queue import Queue
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
 # === CONFIG ===
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")  # session string login
-CHAT_ID = int(os.getenv("CHAT_ID"))           # channel/group id
+SESSION_STRING = os.getenv("SESSION_STRING")
+CHAT_ID = int(os.getenv("CHAT_ID"))  # e.g., -1001234567890
 DOWNLOAD_FOLDER = "downloads"
 ENCODED_FOLDER = "encoded"
 TRACK_FILE = "downloaded.json"
+SUBS_API_URL = "https://subsplease.org/api/?f=latest&tz=UTC"
 
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(ENCODED_FOLDER, exist_ok=True)
 
-# Load tracked episodes
+# === Track downloaded episodes ===
 if os.path.exists(TRACK_FILE):
     with open(TRACK_FILE, "r") as f:
         downloaded_episodes = set(json.load(f))
@@ -31,158 +32,157 @@ def save_tracked():
     with open(TRACK_FILE, "w") as f:
         json.dump(list(downloaded_episodes), f)
 
-# Task queue
-task_queue = Queue()
-current_task = None
+# === Helper Functions ===
+def human_readable(size_bytes):
+    if size_bytes == 0:
+        return "0B"
+    size_name = ("B","KB","MB","GB","TB")
+    i = int(math.floor(math.log(size_bytes,1024)))
+    p = math.pow(1024,i)
+    s = round(size_bytes/p,2)
+    return f"{s}{size_name[i]}"
 
-# === Fancy Progress Bar ===
-def progress_bar(prefix, progress, downloaded, total, speed, eta, elapsed):
-    bar_len = 20
-    filled_len = int(round(bar_len * progress / 100))
-    bar = "█" * filled_len + "▒" * (bar_len - filled_len)
-    return (
-        f"{prefix}\n"
-        f"⌑ {bar} » {progress:.2f}%\n"
-        f"⌑ Done   : {downloaded} of {total}\n"
-        f"⌑ Speed  : {speed}\n"
-        f"⌑ ETA    : {eta}\n"
-        f"⌑ Past   : {elapsed}\n"
-        f"____________________________"
-    )
+def progress_bar(percent, length=20):
+    filled_len = int(length * percent / 100)
+    return "█"*filled_len + "▒"*(length-filled_len)
 
-# === Encode Function ===
-def encode_video(input_path, output_path, callback=None):
-    ext = os.path.splitext(input_path)[1].lower()
-    output_path = os.path.splitext(output_path)[0] + ext
-
-    probe_cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=index,codec_name",
-        "-of", "json", input_path
-    ]
-    result = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    audio_info = json.loads(result.stdout).get("streams", [])
-
-    command = ["ffmpeg", "-i", input_path, "-vf", "scale=-1:720", "-c:v", "libx264",
-               "-preset", "fast", "-crf", "23", "-c:s", "copy"]
-    for stream in audio_info:
-        idx = stream["index"]
-        codec = stream["codec_name"].lower()
-        if codec == "aac":
-            command += [f"-c:a:{idx}", "aac", f"-b:a:{idx}", "128k"]
-        elif codec == "opus":
-            command += [f"-c:a:{idx}", "libopus", f"-b:a:{idx}", "128k"]
-        elif codec == "mp3":
-            command += [f"-c:a:{idx}", "libmp3lame", f"-b:a:{idx}", "128k"]
-        elif codec == "flac":
-            command += [f"-c:a:{idx}", "flac"]
-        else:
-            command += [f"-c:a:{idx}", "aac", f"-b:a:{idx}", "128k"]
-
-    command += ["-y", output_path]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    for line in process.stdout:
-        if callback:
-            callback(line.strip())
-    process.wait()
-    return output_path
-
-# === SubsPlease Auto Download ===
-SUBS_API_URL = "https://subsplease.org/api/?f=latest&tz=UTC"
-
-def get_recent_releases():
-    releases = []
-    try:
-        res = requests.get(SUBS_API_URL, timeout=15).json()
-        for ep in res.get("data", []):
-            title = ep["release_title"]
-            link = ep["link"]
-            releases.append((title, link))
-    except Exception as e:
-        print("SubsPlease API error:", e)
-    return releases
-
-def download_file(url, output_path, callback=None):
+# === Download with fancy progress ===
+def download_file(url, output_path, msg: Message):
     r = requests.get(url, stream=True)
     total_size = int(r.headers.get("content-length", 0))
     downloaded = 0
+    chunk_size = 1024*64
     start_time = time.time()
-    chunk_size = 8192
+
     with open(output_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=chunk_size):
             if chunk:
                 f.write(chunk)
                 downloaded += len(chunk)
-                elapsed = time.time() - start_time
-                speed = downloaded / (1024*1024) / elapsed if elapsed > 0 else 0
-                percent = downloaded * 100 / total_size if total_size else 0
-                eta = (total_size - downloaded) / (1024*1024*speed) if speed else 0
-                if callback:
-                    callback(percent, f"{downloaded/1024/1024:.2f}MB", f"{total_size/1024/1024:.2f}MB",
-                             f"{speed:.2f}MB/s", f"{eta:.0f}s", f"{elapsed:.0f}s")
+                percent = downloaded*100/total_size
+                elapsed = int(time.time() - start_time)
+                speed = human_readable(downloaded/elapsed)+"/s" if elapsed>0 else "0B/s"
+                eta = int((total_size-downloaded)/(downloaded/elapsed)) if downloaded>0 else 0
+                text = (
+                    f"⌑ Downloading » {os.path.basename(output_path)}\n"
+                    f"⌑ {progress_bar(percent)} » {percent:.2f}%\n"
+                    f"⌑ Done   : {human_readable(downloaded)} of {human_readable(total_size)}\n"
+                    f"⌑ Speed  : {speed}\n"
+                    f"⌑ ETA    : {eta}s\n"
+                    f"⌑ Past   : {elapsed}s"
+                )
+                try: msg.edit(text)
+                except: pass
+    msg.edit(f"✅ Download complete » {os.path.basename(output_path)}")
     return output_path
 
+# === Encode with fancy progress ===
+def encode_video(input_path, output_path, msg: Message):
+    ext = os.path.splitext(input_path)[1]
+    output_path = os.path.splitext(output_path)[0]+ext
+
+    command = [
+        "ffmpeg", "-i", input_path,
+        "-vf","scale=-1:720",
+        "-c:v","libx264","-preset","fast","-crf","23",
+        "-c:a","aac","-b:a","128k",
+        "-y", output_path
+    ]
+
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    while True:
+        line = process.stderr.readline()
+        if not line:
+            break
+        if "frame=" in line or "time=" in line:
+            try:
+                msg.edit(f"⌑ Encoding » {os.path.basename(input_path)}\n⌑ {line.strip()}")
+            except: pass
+    process.wait()
+    msg.edit(f"✅ Encoding complete » {os.path.basename(output_path)}")
+    return output_path
+
+# === Upload with fancy progress ===
+def upload_file(client: Client, chat_id, file_path, msg: Message):
+    def progress(current, total):
+        percent = current*100/total
+        bar = progress_bar(percent)
+        text = (
+            f"⌑ Uploading » {os.path.basename(file_path)}\n"
+            f"⌑ {bar} » {percent:.2f}%\n"
+            f"⌑ Done   : {human_readable(current)} of {human_readable(total)}"
+        )
+        try: msg.edit(text)
+        except: pass
+
+    client.send_document(chat_id, file_path, progress=progress)
+    msg.edit(f"✅ Upload complete » {os.path.basename(file_path)}")
+
+# === SubsPlease auto download every 10 minutes ===
 def auto_mode(client: Client):
     while True:
         try:
-            recent = get_recent_releases()
-            for title, url in recent:
-                if url not in downloaded_episodes:
-                    file_path = os.path.join(DOWNLOAD_FOLDER, title + os.path.splitext(url)[1])
-                    def dummy_cb(*a): pass
-                    download_file(url, file_path, callback=dummy_cb)
-                    output_file = os.path.join(ENCODED_FOLDER, os.path.basename(file_path))
-                    encode_video(file_path, output_file, callback=dummy_cb)
-                    client.send_document(CHAT_ID, output_file)
-                    os.remove(file_path)
-                    os.remove(output_file)
-                    downloaded_episodes.add(url)
-                    save_tracked()
-            time.sleep(600)  # every 10 minutes
+            releases = requests.get(SUBS_API_URL, timeout=15).json().get("data", [])
+            for ep in releases:
+                title = ep["release_title"]
+                url = ep["link"]
+                if url in downloaded_episodes: continue
+
+                msg = client.send_message(CHAT_ID, f"Starting download » {title}")
+                local_path = os.path.join(DOWNLOAD_FOLDER, title+os.path.splitext(url)[1])
+                download_file(url, local_path, msg)
+                encoded_path = os.path.join(ENCODED_FOLDER, os.path.basename(local_path))
+                encode_video(local_path, encoded_path, msg)
+                upload_file(client, CHAT_ID, encoded_path, msg)
+
+                os.remove(local_path)
+                os.remove(encoded_path)
+                downloaded_episodes.add(url)
+                save_tracked()
+            time.sleep(600)  # 10 minutes
         except Exception as e:
             print("Auto mode error:", e)
             time.sleep(60)
 
 # === Pyrogram Client ===
-app = Client("anime_bot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
-pending_videos = {}
+app = Client(
+    name="anime_userbot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING
+)
+
+pending_videos = {}  # Track manual uploads
 
 @app.on_message(filters.video | filters.document)
 def handle_video(client, message: Message):
-    file_name = message.document.file_name if message.document else message.video.file_name
-    file_path = os.path.join(DOWNLOAD_FOLDER, file_name)
-    msg = message.reply(f"⌑ Downloading » {file_name}")
+    msg = message.reply("⌑ Preparing file...")
+    file_path = os.path.join(DOWNLOAD_FOLDER, message.document.file_name if message.document else message.video.file_name)
     message.download(file_path)
-    msg.edit(f"⌑ Download complete » {file_name}")
     pending_videos[message.id] = file_path
+    msg.edit(f"✅ Saved » {os.path.basename(file_path)}\nReply with /encode to start encoding.")
 
 @app.on_message(filters.command("encode"))
 def encode_command(client, message: Message):
     if message.reply_to_message:
-        orig_msg_id = message.reply_to_message.id
-        if orig_msg_id not in pending_videos:
+        orig_id = message.reply_to_message.id
+        if orig_id not in pending_videos:
             message.reply("⚠️ File not found. Make sure the video is fully uploaded/downloaded.")
             return
-        input_path = pending_videos[orig_msg_id]
+        input_path = pending_videos[orig_id]
         output_path = os.path.join(ENCODED_FOLDER, os.path.basename(input_path))
-        msg = message.reply(f"⌑ Encoding » {os.path.basename(input_path)}")
+        msg = message.reply(f"⌑ Starting encode » {os.path.basename(input_path)}")
 
-        def progress_cb(line):
-            try:
-                if "frame=" in line or "time=" in line:
-                    msg.edit(f"⌑ {line}")
-            except: pass
+        encode_video(input_path, output_path, msg)
+        upload_file(client, message.chat.id, output_path, msg)
 
-        encode_video(input_path, output_path, callback=progress_cb)
-        msg.edit(f"✅ Done » {os.path.basename(input_path)}")
-        client.send_document(message.chat.id, output_path)
         os.remove(input_path)
         os.remove(output_path)
-        pending_videos.pop(orig_msg_id, None)
+        pending_videos.pop(orig_id)
     else:
         message.reply("Reply to a video/document with /encode to process it.")
 
-# === Run Bot ===
+# === Run bot ===
 if __name__ == "__main__":
     threading.Thread(target=auto_mode, args=(app,), daemon=True).start()
     app.run()
