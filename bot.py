@@ -1,143 +1,140 @@
 import os
-import json
-import time
-import threading
-import subprocess
-import requests
+import asyncio
+import aiofiles
+import aiohttp
 import math
+import shutil
+import time
+import logging
+import psutil
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from datetime import timedelta
+from dotenv import load_dotenv
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import subprocess
 
-# === CONFIG ===
+load_dotenv()
+
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
-CHAT_ID = os.getenv("CHAT_ID")
-DOWNLOAD_FOLDER = "downloads"
-ENCODED_FOLDER = "encoded"
-TRACK_FILE = "downloaded.json"
-SUBS_API_URL = "https://subsplease.org/api/?f=latest&tz=UTC"
+CHAT_ID = int(os.getenv("CHAT_ID"))
 
-os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
-os.makedirs(ENCODED_FOLDER, exist_ok=True)
+logging.basicConfig(level=logging.INFO)
 
-# === Utils ===
-def humanbytes(size):
-    # Converts bytes into readable format
-    if size == 0:
-        return "0B"
-    power = 2**10
-    n = 0
-    Dic_powerN = {0: "B", 1: "KB", 2: "MB", 3: "GB", 4: "TB"}
-    while size > power:
-        size /= power
-        n += 1
-    return f"{round(size,2)} {Dic_powerN[n]}"
+app = Client(
+    name="anime_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING
+)
 
-def progress_bar(done, total):
-    percent = int((done / total) * 100)
-    bar = "█" * (percent // 10) + "▒" * (10 - (percent // 10))
-    return percent, bar
+# -------- Progress Bar --------
+def progress_bar(current, total, length=20):
+    filled = int(length * current // total)
+    bar = "█" * filled + "▒" * (length - filled)
+    percent = (current / total) * 100
+    return f"{bar} {percent:.2f}%"
 
-# === Progress Callback ===
-async def progress_message(msg, task, filename, current, total, start_time):
-    now = time.time()
-    elapsed = now - start_time
-    speed = current / elapsed if elapsed > 0 else 0
-    eta = (total - current) / speed if speed > 0 else 0
+def format_time(seconds: float):
+    return str(timedelta(seconds=int(seconds)))
 
-    percent, bar = progress_bar(current, total)
-    text = (
-        f"📂 Filename: {os.path.basename(filename)}\n"
-        f"{task}: {percent}% [{bar}]\n"
-        f"✅ Done: {humanbytes(current)} / {humanbytes(total)}\n"
-        f"⚡ Speed: {humanbytes(speed)}/s\n"
-        f"⏳ ETA: {int(eta)}s | ⌛ Elapsed: {int(elapsed)}s"
-    )
-    try:
-        await msg.edit_text(text)
-    except:
-        pass
-
-# === Download with progress ===
-async def download_file(client, message, file_id, filename):
-    file_path = os.path.join(DOWNLOAD_FOLDER, filename)
-    status = await message.reply("⬇️ Starting download...")
-
-    start = time.time()
-
-    async def progress(current, total):
-        await progress_message(status, "⬇️ Downloading", filename, current, total, start)
-
-    await client.download_media(file_id, file_name=file_path, progress=progress)
-    return file_path, status
-
-# === Encode Function ===
-def encode_video(input_path, output_path, update_cb=None):
-    command = [
-        "ffmpeg", "-i", input_path,
-        "-vf", "scale=-1:720",
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        "-y", output_path
-    ]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-
+# -------- Video Encoding --------
+async def encode_video(file_path, output_path, update_cb=None):
     total_time = None
     start = time.time()
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", file_path, "-c:v", "libx265", "-crf", "28", output_path,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
 
-    for line in process.stdout:
+    async for line in process.stderr:
+        line = line.decode("utf-8", errors="ignore").strip()
         if "Duration" in line:
-            duration = line.split("Duration:")[1].split(",")[0].strip()
-            h, m, s = duration.split(":")
+            t_str = line.split("Duration:")[1].split(",")[0].strip()
+            h, m, s = t_str.split(":")
             total_time = int(float(h)) * 3600 + int(m) * 60 + float(s)
         if "time=" in line and total_time:
             t_str = line.split("time=")[1].split(" ")[0]
-            h, m, s = t_str.split(":")
-            cur_time = int(float(h)) * 3600 + int(m) * 60 + float(s)
+            try:
+                if ":" in t_str:  # format hh:mm:ss.xx
+                    h, m, s = t_str.split(":")
+                    cur_time = int(float(h)) * 3600 + int(m) * 60 + float(s)
+                else:  # format seconds.xx
+                    cur_time = float(t_str)
+            except Exception:
+                continue
+
             percent = (cur_time / total_time) * 100
             if update_cb:
-                update_cb(cur_time, total_time, start)
+                await update_cb(cur_time, total_time, start)
 
-    process.wait()
-    return output_path
+    await process.wait()
+    return process.returncode == 0
 
-# === Upload with progress ===
-async def upload_file(client, chat_id, file_path, reply_to, msg):
+# -------- Progress Update --------
+async def progress_message(msg: Message, task: str, current, total, start, filename):
+    elapsed = time.time() - start
+    speed = current / elapsed if elapsed > 0 else 0
+    eta = (total - current) / speed if speed > 0 else 0
+    bar = progress_bar(current, total)
+
+    text = (
+        f"📂 **Name:** {os.path.basename(filename)}\n"
+        f"⌑ **Task:** {task}\n"
+        f"⌑ {bar}\n"
+        f"⌑ **Done:** {current/1024/1024:.2f}MB / {total/1024/1024:.2f}MB\n"
+        f"⌑ **Speed:** {speed/1024/1024:.2f}MB/s\n"
+        f"⌑ **ETA:** {format_time(eta)}\n"
+        f"⌑ **Elapsed:** {format_time(elapsed)}"
+    )
+
+    try:
+        await msg.edit_text(text)
+    except Exception:
+        pass
+
+# -------- Encode Command --------
+@app.on_message(filters.command("encode") & filters.reply)
+async def manual_encode(_, message: Message):
+    if not message.reply_to_message or not message.reply_to_message.video:
+        return await message.reply("⚠️ Reply to a video with /encode")
+
+    video = message.reply_to_message.video
+    filename = video.file_name or "video.mp4"
+    input_path = os.path.join("/tmp", filename)
+    output_path = os.path.join("/tmp", f"encoded_{filename}")
+
+    status = await message.reply("📥 Starting download...")
+
+    async def dl_progress(current, total):
+        await progress_message(status, "Downloading", current, total, start, filename)
+
     start = time.time()
+    await app.download_media(video, file_name=input_path, progress=dl_progress)
 
-    async def progress(current, total):
-        await progress_message(msg, "📤 Uploading", file_path, current, total, start)
+    await status.edit_text(f"✅ Download complete: {filename}\n⚙️ Starting encode...")
 
-    await client.send_document(chat_id, file_path, progress=progress, reply_to_message_id=reply_to)
+    async def enc_update(current, total, start_time):
+        await progress_message(status, "Encoding", current, total, start_time, filename)
 
-# === Pyrogram Client ===
-app = Client(name="anime_userbot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
+    ok = await encode_video(input_path, output_path, update_cb=enc_update)
+    if not ok:
+        return await status.edit_text("❌ Encoding failed.")
 
-@app.on_message(filters.video | filters.document)
-async def handle_video(client, message: Message):
-    filename = message.document.file_name if message.document else message.video.file_name
-    file_id = message.document.file_id if message.document else message.video.file_id
+    await status.edit_text("📤 Uploading...")
+    await app.send_document(
+        chat_id=message.chat.id,
+        document=output_path,
+        file_name=f"encoded_{filename}"
+    )
+    await status.edit_text("✅ Process complete!")
 
-    # 1. Download
-    file_path, status = await download_file(client, message, file_id, filename)
-
-    # 2. Encode automatically
-    output_path = os.path.join(ENCODED_FOLDER, filename)
-    async def enc_update(cur, total, start):
-        await progress_message(status, "⚙️ Encoding", filename, cur, total, start)
-
-    encode_video(file_path, output_path, update_cb=enc_update)
-
-    # 3. Upload
-    await upload_file(client, message.chat.id, output_path, message.id, status)
-
-    await status.edit_text(f"✅ Completed {filename}")
-    os.remove(file_path)
+    os.remove(input_path)
     os.remove(output_path)
 
+# -------- Start --------
 if __name__ == "__main__":
-    print("Bot is running...")
+    logging.info("Bot is running...")
     app.run()
