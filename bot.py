@@ -19,7 +19,7 @@ CHAT_ID = int(os.getenv("CHAT_ID"))
 DOWNLOAD_FOLDER = "downloads"
 ENCODED_FOLDER = "encoded"
 TRACK_FILE = "downloaded.json"
-SUBSPLEASE_FEED = "https://subsplease.org/rss/?r=1080"
+SUBSPLEASE_FEED = "https://subsplease.org/rss/?r=1080"  # latest releases RSS
 
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(ENCODED_FOLDER, exist_ok=True)
@@ -30,12 +30,6 @@ if os.path.exists(TRACK_FILE):
         downloaded_episodes = set(json.load(f))
 else:
     downloaded_episodes = set()
-
-# Queue control
-current_task = None
-task_queue = []
-cancel_flag = False
-skip_flag = False
 
 def save_tracked():
     with open(TRACK_FILE, "w") as f:
@@ -48,19 +42,17 @@ def get_progress_bar(current, total, length=20):
     percent = current / total * 100
     return f"{bar} » {percent:.2f}%"
 
-# === FILE DOWNLOAD ===
+# === DOWNLOAD ===
 async def download_file(url, filename, msg: Message):
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as r:
             total = int(r.headers.get("Content-Length", 0))
             downloaded = 0
-            chunk_size = 1024 * 1024
+            chunk_size = 1024 * 1024  # 1 MB
             path = os.path.join(DOWNLOAD_FOLDER, filename)
             start_time = time.time()
             with open(path, "wb") as f:
                 async for chunk in r.content.iter_chunked(chunk_size):
-                    if cancel_flag:
-                        return None
                     f.write(chunk)
                     downloaded += len(chunk)
                     elapsed = time.time() - start_time
@@ -68,21 +60,22 @@ async def download_file(url, filename, msg: Message):
                     eta = (total - downloaded) / (downloaded / elapsed) if downloaded else 0
                     bar = get_progress_bar(downloaded, total)
                     text = (f"Filename : {filename}\n"
-                            f"Task     : Downloading\n"
-                            f"{bar}\n"
-                            f"Done     : {downloaded/1024/1024:.2f}MB of {total/1024/1024:.2f}MB\n"
-                            f"Speed    : {speed:.2f}MB/s\n"
-                            f"ETA      : {eta:.0f}s\n"
-                            f"Elapsed  : {elapsed:.0f}s")
+                            f"Downloading: {bar}\n"
+                            f"Done   : {downloaded / 1024 / 1024:.2f}MB of {total / 1024 / 1024:.2f}MB\n"
+                            f"Speed  : {speed:.2f}MB/s\n"
+                            f"ETA    : {eta:.0f}s\n"
+                            f"Elapsed: {elapsed:.0f}s")
                     try:
                         await msg.edit(text)
-                    except: pass
+                    except:
+                        pass
             return path
 
-# === VIDEO ENCODING ===
-def encode_video(input_path, output_path, msg: Message, loop):
+# === ENCODE ===
+def encode_video(input_path, output_path, msg: Message):
     ext = os.path.splitext(input_path)[1].lower()
     output_path = os.path.splitext(output_path)[0] + ext
+
     command = [
         "ffmpeg", "-i", input_path,
         "-vf", "scale=-1:720",
@@ -90,65 +83,70 @@ def encode_video(input_path, output_path, msg: Message, loop):
         "-c:a", "aac", "-b:a", "128k",
         "-y", output_path
     ]
+
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    start_time = time.time()
     for line in process.stdout:
-        if cancel_flag or skip_flag:
-            process.kill()
-            break
         if "time=" in line:
             try:
-                time_str = line.split("time=")[1].split(" ")[0]
-                parts = time_str.split(":")
+                time_str = line[line.find("time=")+5:line.find(" bitrate")]
                 h, m, s = 0, 0, 0
+                parts = time_str.split(":")
                 if len(parts) == 3:
                     h, m, s = map(float, parts)
                 elif len(parts) == 2:
                     m, s = map(float, parts)
                 elapsed_sec = h*3600 + m*60 + s
-                bar = get_progress_bar(elapsed_sec, elapsed_sec+1)  # approximate
-                text = (f"Filename : {os.path.basename(input_path)}\n"
-                        f"Task     : Encoding\n"
-                        f"{bar}\n"
-                        f"Elapsed  : {elapsed_sec:.0f}s")
-                loop.call_soon_threadsafe(asyncio.create_task, msg.edit(text))
-            except: pass
+                text = f"Encoding: {elapsed_sec:.0f}s processed\nFile: {os.path.basename(input_path)}"
+                try:
+                    asyncio.run(msg.edit(text))
+                except:
+                    pass
+            except:
+                continue
     return output_path
 
 # === PYROGRAM CLIENT ===
 app = Client(name="anime_userbot", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
+pending_videos = {}
+queue = []
 
-# === MANUAL ENCODE CMD ===
-@app.on_message(filters.command("encode") & filters.me)
+# --- Manual encode command ---
+@app.on_message(filters.command("encode") & filters.private)
 async def manual_encode(client, message: Message):
-    global current_task
     if not message.reply_to_message:
-        await message.reply("❌ Reply to a video/document to encode.")
+        await message.reply("❌ Reply to a video to encode it.")
         return
-    file_name = message.reply_to_message.document.file_name if message.reply_to_message.document else message.reply_to_message.video.file_name
+    file_msg = message.reply_to_message
+    file_name = file_msg.document.file_name if file_msg.document else file_msg.video.file_name
     msg = await message.reply(f"⬇️ Downloading {file_name}...")
-    path = await download_file(message.reply_to_message.document.file_id if message.reply_to_message.document else message.reply_to_message.video.file_id, file_name, msg)
-    if not path:
-        await msg.edit("⚠️ Download cancelled.")
-        return
+    path = await download_file(file_msg.document.file_id if file_msg.document else file_msg.video.file_id, file_name, msg)
+
+    # Auto encode after download
     out_file = os.path.join(ENCODED_FOLDER, os.path.basename(path))
     await msg.edit(f"⚙️ Encoding {file_name}...")
-    encode_video(path, out_file, msg, loop=asyncio.get_running_loop())
+    encode_video(path, out_file, msg)
     await msg.edit(f"✅ Finished {file_name}, uploading...")
     await client.send_document(message.chat.id, out_file)
     os.remove(path)
     os.remove(out_file)
 
-# === CANCEL / SKIP CMD ===
-@app.on_message(filters.command(["cancel", "skip"]) & filters.me)
-async def cancel_task(client, message: Message):
-    global cancel_flag, skip_flag
-    if message.text.startswith("/cancel"):
-        cancel_flag = True
-        await message.reply("❌ Current task cancelled.")
-    elif message.text.startswith("/skip"):
-        skip_flag = True
-        await message.reply("⏩ Current task skipped.")
+# --- Handle auto-download videos from chats ---
+@app.on_message(filters.video | filters.document)
+async def handle_video(client, message: Message):
+    file_name = message.document.file_name if message.document else message.video.file_name
+    msg = await message.reply(f"⬇️ Downloading {file_name}...")
+    path = await download_file(message.document.file_id if message.document else message.video.file_id, file_name, msg)
+    pending_videos[message.id] = path
+
+    # Auto encode after download
+    out_file = os.path.join(ENCODED_FOLDER, os.path.basename(path))
+    await msg.edit(f"⚙️ Encoding {file_name}...")
+    encode_video(path, out_file, msg)
+    await msg.edit(f"✅ Finished {file_name}, uploading...")
+    await client.send_document(message.chat.id, out_file)
+    os.remove(path)
+    os.remove(out_file)
+    pending_videos.pop(message.id, None)
 
 # === SUBSPLEASE AUTO-DOWNLOAD ===
 async def fetch_subsplease():
@@ -160,21 +158,36 @@ async def fetch_subsplease():
         for entry in feed.entries:
             title = entry.title
             link = entry.link
+
+            # Skip if already downloaded
             if link in downloaded_episodes:
                 continue
-            filename = f"{title}.mkv"
-            msg = await app.send_message(CHAT_ID, f"⬇️ Auto download: {filename}")
-            path = await download_file(link, filename, msg)
-            if not path:
-                await msg.edit("⚠️ Download cancelled/skipped.")
+
+            # Skip magnet links
+            if link.startswith("magnet:?"):
+                print(f"⚠️ Skipping magnet link: {title}")
                 continue
+
+            print(f"⬇️ Auto download: {title} -> {link}")
+            filename = f"{title}.mkv"
+
+            # Send initial message to Telegram
+            msg = await app.send_message(CHAT_ID, f"⬇️ Downloading {filename}...")
+
+            # Download + encode automatically
+            path = await download_file(link, filename, msg)
             out_file = os.path.join(ENCODED_FOLDER, filename)
-            encode_video(path, out_file, msg, loop=asyncio.get_running_loop())
+            encode_video(path, out_file, msg)
             await app.send_document(CHAT_ID, out_file)
+
+            # Cleanup
             os.remove(path)
             os.remove(out_file)
+
+            # Track as downloaded
             downloaded_episodes.add(link)
             save_tracked()
+
     except Exception as e:
         print("SubsPlease auto error:", e)
 
